@@ -46,6 +46,7 @@ type Session struct {
 	remote    string
 	startedAt time.Time
 	endedAt   time.Time
+	audioKind Kind
 
 	reader  *bufio.Reader
 	scratch []byte
@@ -73,6 +74,11 @@ func NewSession(conn net.Conn, cfg SessionConfig, log *slog.Logger) *Session {
 		out:    audio.NewFrameQueue(cfg.OutQueueFrames),
 		remote: conn.RemoteAddr().String(),
 	}
+	kind, ok := AudioKindForRate(cfg.CallRate)
+	if !ok {
+		kind = KindAudio
+	}
+	s.audioKind = kind
 	s.rmsDB.Store(math.Float64bits(math.Inf(-1)))
 	s.peakDB.Store(math.Float64bits(math.Inf(-1)))
 	return s
@@ -109,11 +115,13 @@ func (s *Session) Attach(ep bridge.Endpoint) { s.ep = ep }
 // UUID returns the identified call UUID.
 func (s *Session) UUID() string { return s.uuid }
 
-// Reject sends an AudioSocket error frame and leaves the connection open for
-// the caller to close.
+// Reject reports why the call cannot be served and asks the peer to hang up.
+// Asterisk treats the error frame as fatal, so the hangup frame is best effort.
 func (s *Session) Reject(reason string) {
 	_ = s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
-	_, _ = s.conn.Write(AppendFrame(nil, KindError, []byte(reason)))
+	buf := AppendFrame(nil, KindError, []byte(reason))
+	buf = AppendHangup(buf)
+	_, _ = s.conn.Write(buf)
 }
 
 // Run serves the call until the peer hangs up, the context is cancelled or the
@@ -224,18 +232,24 @@ func (s *Session) readLoop(ctx context.Context) error {
 		scratch = payload[:0]
 
 		switch kind {
-		case KindAudio:
+		case s.audioKind:
 			s.handleAudio(payload)
+		case KindHangup:
+			s.log.Info("peer requested hangup")
+			return nil
 		case KindDTMF:
 			s.dtmfCount.Add(1)
 			s.log.Debug("dtmf digit", "digit", string(payload))
 		case KindError:
-			s.log.Warn("peer reported error", "message", strings.TrimSpace(string(payload)))
-		case KindVideo:
-			s.unsupported.Add(1)
+			s.log.Warn("peer reported error", "code", strings.TrimSpace(string(payload)))
 		case KindUUID:
 			s.log.Warn("duplicate uuid frame ignored")
 		default:
+			if kind.IsAudio() {
+				// A rate we did not negotiate; dropping it is safer than
+				// feeding mismatched audio into the call.
+				s.log.Warn("audio frame with unexpected rate", "kind", kind.String(), "want", s.audioKind.String())
+			}
 			s.unsupported.Add(1)
 		}
 	}
@@ -296,7 +310,7 @@ func (s *Session) writeLoop(ctx context.Context) {
 		if err != nil {
 			return
 		}
-		buf = AppendFrame(buf[:0], KindAudio, payload)
+		buf = AppendFrame(buf[:0], s.audioKind, payload)
 		if err := s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)); err != nil {
 			return
 		}

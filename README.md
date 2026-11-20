@@ -35,9 +35,21 @@ Asterisk / MikoPBX                         audiosocket-bridge
 Properties:
 
 - Official AudioSocket framing: `kind` (1 byte), big-endian payload length
-  (2 bytes), payload.
-- Frames handled: UUID (`0x00`), audio (`0x01`), DTMF (`0x03`), error (`0x04`).
-  Video (`0x02`) and unknown kinds are counted and ignored.
+  (2 bytes), payload. Matches Asterisk's `include/asterisk/res_audiosocket.h`.
+- Frame kinds:
+
+  | Kind | Meaning | Direction |
+  | --- | --- | --- |
+  | `0x00` | hangup (empty payload) | bridge → Asterisk |
+  | `0x01` | UUID, 16 raw bytes | Asterisk → bridge |
+  | `0x03` | DTMF digit, 1 ASCII byte | Asterisk → bridge |
+  | `0x10` | signed linear 16-bit mono PCM, 8 kHz | both |
+  | `0x11`–`0x18` | same, 12/16/24/32/44.1/48/96/192 kHz | both |
+  | `0xFF` | error, optional error code | bridge → Asterisk |
+
+  The outbound audio kind follows `BRIDGE_CALL_RATE`. Audio frames at a rate
+  that was not negotiated are counted and dropped rather than mixed into the
+  call. Unknown kinds are counted and ignored.
 - Partial TCP reads, coalesced frames, zero-length frames and oversize frames
   are handled explicitly.
 - Audio is 8 kHz mono s16le by default. Other rates are configurable.

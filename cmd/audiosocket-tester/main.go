@@ -34,6 +34,10 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	audioKind, ok := audiosocket.AudioKindForRate(*rate)
+	if !ok {
+		fatal(fmt.Errorf("unsupported sample rate %d", *rate))
+	}
 
 	conn, err := net.DialTimeout("tcp", *addr, 5*time.Second)
 	if err != nil {
@@ -63,15 +67,21 @@ func main() {
 				}
 				return
 			}
-			switch kind {
-			case audiosocket.KindAudio:
+			switch {
+			case kind == audiosocket.KindHangup:
+				return
+			case kind.IsAudio():
+				if kind != audioKind {
+					fmt.Printf("unexpected audio kind 0x%02x\n", uint8(kind))
+					continue
+				}
 				firstReply.CompareAndSwap(0, int64(time.Since(start)))
 				receivedFrames.Add(1)
 				receivedBytes.Add(uint64(len(payload)))
 				if rms, _ := level(payload); !math.IsInf(rms, 0) {
 					lastRMSBits.Store(math.Float64bits(rms))
 				}
-			case audiosocket.KindError:
+			case kind == audiosocket.KindError:
 				fmt.Printf("server error frame: %s\n", strings.TrimSpace(string(payload)))
 			}
 		}
@@ -99,7 +109,7 @@ loop:
 		case <-ticker.C:
 			fillTone(frame, sample, *rate, *freq)
 			sample += frameBytes / 2
-			if _, err := conn.Write(audiosocket.AppendFrame(nil, audiosocket.KindAudio, frame)); err != nil {
+			if _, err := conn.Write(audiosocket.AppendFrame(nil, audioKind, frame)); err != nil {
 				fmt.Printf("write failed: %v\n", err)
 				break loop
 			}

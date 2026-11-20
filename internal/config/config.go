@@ -137,8 +137,10 @@ func (c Config) Validate() error {
 	if c.LogFormat != "json" && c.LogFormat != "text" {
 		add("BRIDGE_LOG_FORMAT must be \"json\" or \"text\", got %q", c.LogFormat)
 	}
-	if c.CallRate < 8000 || c.CallRate > 192000 {
-		add("BRIDGE_CALL_RATE must be between 8000 and 192000, got %d", c.CallRate)
+	switch c.CallRate {
+	case 8000, 12000, 16000, 24000, 32000, 44100, 48000, 96000, 192000:
+	default:
+		add("BRIDGE_CALL_RATE must be an AudioSocket slin rate (8000, 12000, 16000, 24000, 32000, 44100, 48000, 96000, 192000), got %d", c.CallRate)
 	}
 	if c.FrameDuration < 5*time.Millisecond || c.FrameDuration > 100*time.Millisecond {
 		add("BRIDGE_FRAME_MS must be between 5ms and 100ms, got %s", c.FrameDuration)
