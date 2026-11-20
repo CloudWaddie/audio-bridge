@@ -92,9 +92,9 @@ func Load() (Config, error) {
 		InBufferMS:        l.integer("BRIDGE_IN_BUFFER_MS", 500),
 		OutQueueFrames:    l.integer("BRIDGE_OUT_QUEUE_FRAMES", 50),
 		UUIDTimeout:       l.duration("BRIDGE_UUID_TIMEOUT", 3*time.Second),
-		ReadTimeout:       l.duration("BRIDGE_READ_TIMEOUT", 2*time.Minute),
+		ReadTimeout:       l.duration("BRIDGE_READ_TIMEOUT", 0),
 		WriteTimeout:      l.duration("BRIDGE_WRITE_TIMEOUT", 10*time.Second),
-		MaxCallDuration:   l.duration("BRIDGE_MAX_CALL_DURATION", 4*time.Hour),
+		MaxCallDuration:   l.duration("BRIDGE_MAX_CALL_DURATION", 0),
 		ShutdownTimeout:   l.duration("BRIDGE_SHUTDOWN_TIMEOUT", 10*time.Second),
 		CollectAudioStats: l.boolean("BRIDGE_COLLECT_AUDIO_STATS", true),
 		Virtual: VirtualConfig{

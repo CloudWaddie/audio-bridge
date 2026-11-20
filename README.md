@@ -77,9 +77,10 @@ BRIDGE_MODE=echo ./bin/audiosocket-bridge
 In another shell, verify the protocol end to end without a phone call:
 
 ```sh
-./bin/audiosocket-tester -addr 127.0.0.1:9092 -duration 3s
-# frames sent=150 received=150 lost=0 ... OK
+./bin/audiosocket-tester -addr 127.0.0.1:9092
 ```
+
+Press Ctrl+C to end the test and print the results. Pass `-duration 3s` for a timed smoke test.
 
 Check health and statistics:
 
@@ -135,9 +136,9 @@ Environment only. All values can live in `.env`; see `.env.example`.
 | `BRIDGE_IN_BUFFER_MS` | `500` | Call → device smoothing buffer |
 | `BRIDGE_OUT_QUEUE_FRAMES` | `50` | Device → call queue depth (1 s) |
 | `BRIDGE_UUID_TIMEOUT` | `3s` | Deadline for the first frame |
-| `BRIDGE_READ_TIMEOUT` | `2m` | Idle read deadline, `0` disables |
+| `BRIDGE_READ_TIMEOUT` | `0` | Idle read deadline, `0` disables |
 | `BRIDGE_WRITE_TIMEOUT` | `10s` | Socket write deadline |
-| `BRIDGE_MAX_CALL_DURATION` | `4h` | Hard call limit, `0` disables |
+| `BRIDGE_MAX_CALL_DURATION` | `0` | Hard call limit, `0` disables |
 | `BRIDGE_SHUTDOWN_TIMEOUT` | `10s` | Graceful shutdown budget |
 | `BRIDGE_COLLECT_AUDIO_STATS` | `true` | RMS/peak metering (no audio kept) |
 | `BRIDGE_PA_PLAYBACK_SINK` | `audiosocket_mic` | Sink for phone audio |

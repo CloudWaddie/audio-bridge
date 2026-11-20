@@ -24,11 +24,15 @@ import (
 func main() {
 	addr := flag.String("addr", "127.0.0.1:9092", "AudioSocket server address")
 	uuidText := flag.String("uuid", "409c8f2a-1122-3344-5566-778899aabbcc", "call UUID")
-	duration := flag.Duration("duration", 10*time.Second, "test duration")
+	duration := flag.Duration("duration", 0, "test duration (0 runs until interrupted or disconnected)")
 	freq := flag.Float64("tone", 440, "tone frequency in Hz")
 	rate := flag.Int("rate", 8000, "sample rate in Hz")
 	expectEcho := flag.Bool("expect-echo", true, "fail when no audio is returned")
 	flag.Parse()
+
+	if *duration < 0 {
+		fatal(fmt.Errorf("test duration must be non-negative"))
+	}
 
 	uuid, err := parseUUID(*uuidText)
 	if err != nil {
@@ -57,7 +61,9 @@ func main() {
 	var firstReply atomic.Int64
 	start := time.Now()
 
+	peerDone := make(chan struct{})
 	go func() {
+		defer close(peerDone)
 		r := bufio.NewReaderSize(conn, 8192)
 		for {
 			kind, payload, err := audiosocket.ReadFrame(r, 65535, nil)
@@ -93,18 +99,28 @@ func main() {
 	defer ticker.Stop()
 
 	var sentFrames atomic.Uint64
-	deadline := time.NewTimer(*duration)
-	defer deadline.Stop()
+	var deadline <-chan time.Time
+	if *duration > 0 {
+		timer := time.NewTimer(*duration)
+		defer timer.Stop()
+		deadline = timer.C
+	}
 	sample := 0
 
-	fmt.Printf("sending %s of %.0f Hz tone to %s as %s\n", *duration, *freq, *addr, *uuidText)
+	if *duration > 0 {
+		fmt.Printf("sending %s of %.0f Hz tone to %s as %s\n", *duration, *freq, *addr, *uuidText)
+	} else {
+		fmt.Printf("sending %.0f Hz tone to %s as %s (Ctrl+C to hang up)\n", *freq, *addr, *uuidText)
+	}
 
 loop:
 	for {
 		select {
 		case <-ctx.Done():
 			break loop
-		case <-deadline.C:
+		case <-peerDone:
+			break loop
+		case <-deadline:
 			break loop
 		case <-ticker.C:
 			fillTone(frame, sample, *rate, *freq)
