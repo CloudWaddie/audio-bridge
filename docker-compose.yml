@@ -1,0 +1,69 @@
+name: audiosocket-bridge
+
+services:
+  bridge:
+    build:
+      context: .
+      args:
+        VERSION: ${BRIDGE_VERSION:-dev}
+    image: ${BRIDGE_IMAGE:-audiosocket-bridge:latest}
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BRIDGE_MODE: ${BRIDGE_MODE:-echo}
+      BRIDGE_LISTEN_ADDR: 0.0.0.0:9092
+      BRIDGE_HEALTH_ADDR: 0.0.0.0:8080
+      PULSE_SERVER: ${PULSE_SERVER:-unix:/pulse/native}
+    volumes:
+      # Shared with the audio service and, later, with the Chromium container.
+      - pulse:/pulse
+    expose:
+      # Internal only. There is deliberately no "ports:" mapping for 9092.
+      - "9092"
+    depends_on:
+      audio:
+        condition: service_healthy
+    networks:
+      - voice
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  # PulseAudio with two null sinks. Phone audio is played into
+  # audiosocket_mic, whose monitor is exposed as the "AudioSocket_Mic" source
+  # so Chromium can capture it. Chromium's output goes to audiosocket_spk and
+  # is captured from audiosocket_spk.monitor.
+  audio:
+    build: ./docker/audio
+    restart: unless-stopped
+    environment:
+      PULSE_SERVER: unix:/pulse/native
+    volumes:
+      - pulse:/pulse
+    networks:
+      - voice
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "pactl", "info"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+networks:
+  voice:
+    name: ${BRIDGE_NETWORK_NAME:-audiosocket}
+    # Attach to an existing network (for example the one MikoPBX uses) by
+    # setting BRIDGE_NETWORK_EXTERNAL=true.
+    external: ${BRIDGE_NETWORK_EXTERNAL:-false}
+
+volumes:
+  pulse:
