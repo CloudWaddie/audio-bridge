@@ -30,6 +30,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, urlunsplit
 
 from camoufox.async_api import AsyncCamoufox
 
@@ -53,9 +54,19 @@ def _env_bool(name: str, default: bool) -> bool:
 class Config:
     def __init__(self) -> None:
         self.profile_dir = _env("CF_PROFILE_DIR", "/data/profile")
-        # ?mode=voice lands directly on the voice-capable page; it works
-        # both logged in and anonymously (Free-tier Live access).
-        self.url = _env("CF_URL", "https://chatgpt.com/?mode=voice")
+        # The voice page, opened only while a call is active: logged in,
+        # ?mode=voice auto-starts the voice session; anonymous shows a
+        # "Tap to talk" button. Idling there would keep a session open
+        # with nobody on the line, so the idle page is the same URL
+        # without the mode parameter.
+        self.voice_url = _env("CF_URL", "https://chatgpt.com/?mode=voice")
+        parts = urlsplit(self.voice_url)
+        idle_query = "&".join(
+            part
+            for part in parts.query.split("&")
+            if part and not part.startswith("mode=")
+        )
+        self.idle_url = urlunsplit(parts._replace(query=idle_query))
         self.bridge_stats_url = _env("CF_BRIDGE_STATS_URL", "http://bridge:8080/stats")
         self.login_only = _env_bool("CF_LOGIN_ONLY", False)
         # Voice can run anonymously; set true to require a logged-in profile.
@@ -225,20 +236,17 @@ VOICE_END_SELECTORS = [
 
 END_NAME_RE = re.compile(r"end.*(chat|call|voice)|close.*(chat|call|voice)", re.I)
 
-# Anonymous sessions also show the composer, so its presence alone proves
-# nothing. These markers only count as logged in when the LOGOUT_MARKERS are
-# absent.
-COMPOSER_MARKERS = [
-    "#prompt-textarea",
-    'div[id="composer-background"]',
-]
-
-LOGOUT_MARKERS = [
-    'button[data-testid="login-button"]',
-    'button[data-testid="signup-button"]',
-    'a[data-testid="login-link"]',
-    'button[data-testid*="login" i]',
-]
+# Login detection. Every ChatGPT document embeds the bootstrap session
+# payload in a <script> tag. Its federatedLogoutUrl is null for anonymous
+# visitors and a real auth.openai.com URL once a session exists -- verified
+# in both states, including mid-voice-session, on the live site (saved DOMs:
+# loggedin.html, loggedout2.html, vchat.html). Plain text matching cannot
+# replace it: the embedded JSON contains "login" strings either way
+# (loginWebUrl, login page variants), so the old text-based check
+# misclassified logged-in pages.
+FEDERATED_LOGOUT_RE = re.compile(r'"federatedLogoutUrl"\s*:\s*(null|"[^"]*")')
+CHALLENGE_RE = re.compile(r"verify you are human|just a moment|cf-challenge", re.I)
+LOGIN_CONTROL_RE = re.compile(r"log ?in|sign ?up", re.I)
 
 VOICE_RATE_LIMIT_SELECTORS = [
     '[data-testid="modal-voice-rate-limit"]',
@@ -300,15 +308,23 @@ async def detect_login(page) -> str:
     try:
         if "/auth/login" in page.url:
             return "out"
-        for marker in LOGOUT_MARKERS:
-            if await page.locator(marker).count() > 0:
+        try:
+            html = await page.content()
+        except Exception:
+            html = ""
+        if CHALLENGE_RE.search(html):
+            return "unknown"
+        match = FEDERATED_LOGOUT_RE.search(html)
+        if match:
+            return "out" if match.group(1) == "null" else "in"
+        # No payload yet (page still loading or a stripped view): fall
+        # back to the visible login affordances, then to the host.
+        for role in ("link", "button"):
+            control = page.get_by_role(role, name=LOGIN_CONTROL_RE)
+            if await control.count() > 0 and await control.first.is_visible():
                 return "out"
-        for marker in COMPOSER_MARKERS:
-            if await page.locator(marker).count() > 0:
-                return "in"
-        link = page.get_by_role("link", name=re.compile(r"log ?in", re.I))
-        if await link.count() > 0:
-            return "out"
+        if "chatgpt.com" in page.url:
+            return "in"
     except Exception:
         return "unknown"
     return "unknown"
@@ -330,8 +346,11 @@ async def voice_overlay_present(page) -> bool:
 
     Only two signals count, both verified against the live site:
       - an audio element driven by a MediaStream and playing,
-      - the live orb container (exact testid; the entry page also contains
-        voice-branded marketing elements that must not match).
+      - the live orb container (exact testid), visible. The orb element
+        stays in the DOM after the session ends -- measured closed
+        state: the wrapper gains the `invisible` class
+        (visibility:hidden) -- so count() alone would never report the
+        session as ended.
     """
     try:
         playing = await page.evaluate(
@@ -344,9 +363,8 @@ async def voice_overlay_present(page) -> bool:
         )
         if playing:
             return True
-        return await page.locator(
-            'div[data-testid="avatar-overlay-voice-orb"]'
-        ).count() > 0
+        orb = page.locator('div[data-testid="avatar-overlay-voice-orb"]')
+        return await orb.count() > 0 and await orb.first.is_visible()
     except Exception:
         return False
 
@@ -500,9 +518,12 @@ async def session_loop(context, stop: asyncio.Event) -> None:
     voice = VoiceController(page)
     failures = 0
     last_login_state = None
+    # True while the page sits on the voice URL. Navigated to only when
+    # a call is active; every other goto returns to the idle page.
+    on_voice_page = False
 
-    await page.goto(CFG.url, wait_until="domcontentloaded", timeout=60_000)
-    log.info("opened %s", CFG.url)
+    await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
+    log.info("opened %s (idle)", CFG.idle_url)
 
     while not stop.is_set():
         try:
@@ -535,29 +556,30 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                 if voice.active or await voice_overlay_present(page):
                     await voice.recover()
                 if voice.active:
-                    # No call can be active; reset to a fresh chat for the
-                    # next one.
+                    # No call can be active; return to the idle page.
                     try:
-                        await page.goto(CFG.url, wait_until="domcontentloaded", timeout=60_000)
+                        await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
                         voice.active = False
+                        on_voice_page = False
                         STATUS.update(voice_active=False)
-                        log.info("bridge unreachable; fresh chat opened")
+                        log.info("bridge unreachable; idle page opened")
                     except Exception as exc:
-                        log.warning("could not open a fresh chat: %s", exc)
+                        log.warning("could not open the idle page: %s", exc)
                 await asyncio.sleep(CFG.poll_interval)
                 continue
 
             if not active and not voice.active and await voice_overlay_present(page):
-                # A stray overlay (page reloaded into voice mode, or the
-                # session leaked): close it so the allowance is not burned
-                # between calls. If it will not close, reload once instead
-                # of thrashing the page every poll.
+                # A stray overlay (the session leaked, or a reload landed
+                # back in voice mode): close it so the allowance is not
+                # burned between calls. If it will not close, reload to
+                # the idle page instead of thrashing every poll.
                 log.info("closing stray voice overlay between calls")
                 await voice.recover()
                 if await voice_overlay_present(page):
                     try:
-                        await page.goto(CFG.url, wait_until="domcontentloaded", timeout=60_000)
-                        log.info("stray overlay would not close; reloaded the page")
+                        await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
+                        on_voice_page = False
+                        log.info("stray overlay would not close; reloaded the idle page")
                     except Exception as exc:
                         log.warning("could not reload after failed cleanup: %s", exc)
 
@@ -567,15 +589,32 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                     if failures == 0:
                         await save_debug(page, "call-without-login")
                     failures += 1
-                elif await voice.start():
-                    sessions = STATUS.snapshot()["voice_sessions_started"] + 1
-                    STATUS.update(
-                        voice_active=True,
-                        ready=True,
-                        voice_sessions_started=sessions,
-                    )
-                elif not voice.limit_hit:
-                    failures += 1
+                else:
+                    if not on_voice_page:
+                        # One navigation per call. While a call is active
+                        # the page sits on the voice URL: logged in,
+                        # ?mode=voice auto-starts the session; anonymous
+                        # shows the "Tap to talk" button. Navigating
+                        # again each poll would interrupt hydration, so
+                        # retry voice.start() on the same page instead.
+                        try:
+                            await page.goto(
+                                CFG.voice_url, wait_until="domcontentloaded", timeout=60_000
+                            )
+                            on_voice_page = True
+                            log.info("opened %s for the call", CFG.voice_url)
+                        except Exception as exc:
+                            failures += 1
+                            log.warning("could not open the voice page: %s", exc)
+                    if on_voice_page and await voice.start():
+                        sessions = STATUS.snapshot()["voice_sessions_started"] + 1
+                        STATUS.update(
+                            voice_active=True,
+                            ready=True,
+                            voice_sessions_started=sessions,
+                        )
+                    elif on_voice_page and not voice.limit_hit:
+                        failures += 1
 
             elif not active and voice.active:
                 ended = await voice.end()
@@ -584,17 +623,20 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                     STATUS.update(voice_sessions_ended=sessions)
                 else:
                     failures += 1
-                # Open a fresh chat so the next call starts a new
-                # conversation (and as a hard cleanup: navigating away
-                # tears down a voice overlay that refused to close).
+                # Return to the idle page (and as a hard cleanup:
+                # navigating away tears down a voice overlay that
+                # refused to close, and the next call navigates to the
+                # voice page again for a fresh conversation).
                 try:
-                    await page.goto(CFG.url, wait_until="domcontentloaded", timeout=60_000)
+                    await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
                     voice.active = False
+                    on_voice_page = False
                     STATUS.update(voice_active=False)
-                    log.info("fresh chat opened for the next call")
+                    log.info("returned to the idle page after the call")
                 except Exception as exc:
                     failures += 1
-                    log.warning("could not open a fresh chat: %s", exc)
+                    on_voice_page = False
+                    log.warning("could not open the idle page: %s", exc)
 
             elif active and voice.active:
                 # Watch for the overlay disappearing mid-call.
@@ -682,8 +724,10 @@ async def main() -> None:
     setup_logging()
     server = start_health_server()
     log.info(
-        "controller starting: url=%s bridge=%s login_only=%s profile=%s",
-        CFG.url,
+        "controller starting: voice_url=%s idle_url=%s bridge=%s "
+        "login_only=%s profile=%s",
+        CFG.voice_url,
+        CFG.idle_url,
         CFG.bridge_stats_url,
         CFG.login_only,
         CFG.profile_dir,

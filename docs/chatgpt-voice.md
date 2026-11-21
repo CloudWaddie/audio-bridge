@@ -38,8 +38,9 @@ set `BRIDGE_MODE=echo` and the stack behaves exactly as before.
 
 ## How the web page behaves (measured, Nov 2026)
 
-The browser opens `https://chatgpt.com/?mode=voice`. Verified against the
-live site:
+The browser idles on `https://chatgpt.com/` and opens
+`https://chatgpt.com/?mode=voice` only while a call is active, so no
+session runs between calls. Verified against the live site:
 
 - **No login required to test**: the anonymous page offers a single
   **Tap to talk** button. One tap starts a GPT-Live session; no tap is needed
@@ -48,6 +49,9 @@ live site:
   with two text-labelled controls: **Mute** and **End call**. None of the
   voice controls carry ids or aria-labels; the controller finds them by role
   and text, which survived this DOM.
+- After **End call** the orb element stays in the DOM wrapped in an
+  `invisible` (visibility:hidden) container, so the controller checks
+  visibility, not element count, when deciding whether a session is over.
 - **End call** returns to the idle page. Reloading (or the next tap) starts a
   *fresh* conversation — this is what makes "new call = new chat" true.
 - With a **logged-in profile** the same page runs under your plan's Live
