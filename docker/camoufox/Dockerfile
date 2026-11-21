@@ -34,6 +34,12 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
+# fpgen stores its model inside the installed package directory. pip
+# installed it as root, so hand just that package to the runtime user; the
+# browser cache already lives in the camoufox home.
+RUN FPGEN_DIR=$(python3 -c "import fpgen, os; print(os.path.dirname(fpgen.__file__))") \
+    && chown -R camoufox:audiosocket "$FPGEN_DIR"
+
 # Download the pinned browser build at image build time. Must run as the user
 # that owns the cache, which is also the user the browser runs as.
 USER camoufox
