@@ -50,6 +50,7 @@ RUN camoufox fetch
 
 COPY --chown=camoufox:audiosocket entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY --chown=camoufox:audiosocket controller.py /app/controller.py
+COPY --chown=camoufox:audiosocket announcements/ /app/announcements/
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 
 ENV HOME=/home/camoufox \

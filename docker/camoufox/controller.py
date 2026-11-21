@@ -30,9 +30,11 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from camoufox.async_api import AsyncCamoufox
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 # --------------------------------------------------------------------------
 # Configuration
@@ -219,20 +221,16 @@ async def call_active() -> bool | None:
 VOICE_BUTTON_SELECTORS = [
     # Composer entry, measured on the live site (anonymous and logged-in).
     'button[aria-label="Start Voice"]',
-    'button[data-testid*="voice" i]',
-    'button[aria-label*="voice" i]',
-    # Anonymous ?mode=voice landing page: the entry control has no id, no
-    # testid and no aria-label; its stable surface is the button text.
-    'button:has-text("Tap to talk")',
 ]
+# The anonymous landing page exposes "Tap to talk" as the accessible name.
 
-VOICE_NAME_RE = re.compile(r"voice|tap to talk", re.I)
+VOICE_NAME_RE = re.compile(r"^(?:tap to talk|(?:start|use|enter)(?: new)? voice(?: mode| chat)?|voice mode)$", re.I)
 
 # The session controls are text-labelled ("End call") with no stable
 # testids. Loose attribute matching is unsafe here: "close" also matches
 # the sidebar's close-sidebar-button and "end" the composer's Send, so
 # the end control is located by accessible name only.
-END_NAME_RE = re.compile(r"end.*(chat|call|voice)|close.*(chat|call|voice)", re.I)
+END_NAME_RE = re.compile(r"^(?:end|close) (?:call|chat|voice(?: chat| mode)?)$", re.I)
 
 # Login detection. Every ChatGPT document embeds the bootstrap session
 # payload in a <script> tag. Its federatedLogoutUrl is null for anonymous
@@ -244,11 +242,10 @@ END_NAME_RE = re.compile(r"end.*(chat|call|voice)|close.*(chat|call|voice)", re.
 # misclassified logged-in pages.
 FEDERATED_LOGOUT_RE = re.compile(r'"federatedLogoutUrl"\s*:\s*(null|"[^"]*")')
 CHALLENGE_RE = re.compile(r"verify you are human|just a moment|cf-challenge", re.I)
-LOGIN_CONTROL_RE = re.compile(r"log ?in|sign ?up", re.I)
+LOGIN_CONTROL_RE = re.compile(r"^(?:log ?in|sign ?up)$", re.I)
 
 VOICE_RATE_LIMIT_SELECTORS = [
     '[data-testid="modal-voice-rate-limit"]',
-    '[data-testid="blocking-initial-modals-done"] ~ [data-testid="close-button"]',
 ]
 
 # Quiet period after the voice rate-limit modal appears (anonymous free
@@ -260,18 +257,16 @@ async def _first_visible(page, selectors: list[str], role: tuple[str, re.Pattern
     """Return the first visible locator among the candidates, else None."""
     for sel in selectors:
         try:
-            locator = page.locator(sel)
-            if await locator.count() == 0:
-                continue
-            if await locator.first.is_visible():
-                return locator.first
+            locator = page.locator(sel).filter(visible=True).first
+            if await locator.is_visible():
+                return locator
         except Exception:
             continue
     if role is not None:
         try:
-            locator = page.get_by_role(role[0], name=role[1])
-            if await locator.count() > 0 and await locator.first.is_visible():
-                return locator.first
+            locator = page.get_by_role(role[0], name=role[1]).filter(visible=True).first
+            if await locator.is_visible():
+                return locator
         except Exception:
             pass
     return None
@@ -279,9 +274,9 @@ async def _first_visible(page, selectors: list[str], role: tuple[str, re.Pattern
 
 async def find_voice_button(page):
     if CFG.voice_selector:
-        locator = page.locator(CFG.voice_selector)
-        if await locator.count() > 0:
-            return locator.first
+        locator = await _first_visible(page, [CFG.voice_selector])
+        if locator is not None:
+            return locator
     button = await _first_visible(page, VOICE_BUTTON_SELECTORS)
     if button is not None:
         return button
@@ -292,16 +287,16 @@ async def find_voice_button(page):
 
 async def find_end_control(page):
     if CFG.end_selector:
-        locator = page.locator(CFG.end_selector)
-        if await locator.count() > 0:
-            return locator.first
+        locator = await _first_visible(page, [CFG.end_selector])
+        if locator is not None:
+            return locator
     return await _first_visible(page, [], role=("button", END_NAME_RE))
 
 
 async def detect_login(page) -> str:
     """'in', 'out' or 'unknown'."""
     try:
-        if "/auth/login" in page.url:
+        if urlsplit(page.url).path.rstrip("/") == "/auth/login":
             return "out"
         try:
             html = await page.content()
@@ -313,13 +308,10 @@ async def detect_login(page) -> str:
         if match:
             return "out" if match.group(1) == "null" else "in"
         # No payload yet (page still loading or a stripped view): fall
-        # back to the visible login affordances, then to the host.
+        # back to visible login controls. An unresolved page stays unknown.
         for role in ("link", "button"):
-            control = page.get_by_role(role, name=LOGIN_CONTROL_RE)
-            if await control.count() > 0 and await control.first.is_visible():
+            if await _first_visible(page, [], role=(role, LOGIN_CONTROL_RE)):
                 return "out"
-        if "chatgpt.com" in page.url:
-            return "in"
     except Exception:
         return "unknown"
     return "unknown"
@@ -329,9 +321,9 @@ async def voice_rate_limited(page) -> bool:
     """True when the voice rate-limit modal is on the page."""
     try:
         for selector in VOICE_RATE_LIMIT_SELECTORS:
-            if await page.locator(selector).count() > 0:
+            if await page.locator(selector).filter(visible=True).first.is_visible():
                 return True
-        return False
+        return await page.get_by_text(re.compile(r"^Voice limit reached\b", re.I)).filter(visible=True).first.is_visible()
     except Exception:
         return False
 
@@ -358,8 +350,8 @@ async def voice_overlay_present(page) -> bool:
         )
         if playing:
             return True
-        orb = page.locator('div[data-testid="avatar-overlay-voice-orb"]')
-        return await orb.count() > 0 and await orb.first.is_visible()
+        orb = page.get_by_test_id("avatar-overlay-voice-orb").filter(visible=True).first
+        return await orb.is_visible()
     except Exception:
         return False
 
@@ -406,71 +398,111 @@ class VoiceController:
         self.failures = 0
         self.limit_hit = False
         self.limit_until = 0.0
+        self.blocked = False
 
     async def start(self) -> bool:
         page = self.page
         if time.monotonic() < self.limit_until:
-            # Quiet period after the rate-limit modal; do not hammer.
+            await self.block("limit", "ChatGPT Voice usage limit reached")
             return False
-        if await voice_overlay_present(page):
-            # The page can open straight into a live voice session (for
-            # example ?mode=voice). Nothing to click.
-            self.active = True
-            self.failures = 0
-            log.info("voice session already active on the page")
-            return True
-        if await voice_rate_limited(page):
-            await self._dismiss_rate_limit(page)
-            self.limit_hit = True
-            self.limit_until = time.monotonic() + RATE_LIMIT_BACKOFF_S
-            STATUS.update(
-                voice_limited=True,
-                last_error="voice rate limited (anonymous free tier); "
-                           "log in via noVNC or wait for the reset",
-            )
-            log.warning(
-                "voice rate-limited; backing off for %ss",
-                RATE_LIMIT_BACKOFF_S,
-            )
+        if self.blocked:
             return False
-        button = await find_voice_button(page)
-        if button is None:
-            if self.failures == 0 or self.failures % 10 == 0:
-                await save_debug(page, "voice-button-missing")
-            self.failures += 1
-            return False
-        if not await click(button):
-            self.failures += 1
-            await save_debug(page, "voice-click-failed")
-            return False
-
         deadline = time.monotonic() + CFG.voice_start_timeout
+        clicked = False
+        setup_steps = set()
         while time.monotonic() < deadline:
+            if await voice_rate_limited(page):
+                await self._dismiss_rate_limit(page)
+                self.limit_hit = True
+                self.limit_until = time.monotonic() + RATE_LIMIT_BACKOFF_S
+                STATUS.update(voice_limited=True)
+                await self.block("limit", "ChatGPT Voice usage limit reached")
+                return False
+            for clip, message in (
+                ("microphone", r"^Microphone permission denied$"),
+                ("unavailable", r"^(?:Voice chat couldn['’]t start|Unable to start voice chat|Voice unavailable(?: [—–-] reload to try again)?)$"),
+            ):
+                error = page.get_by_text(re.compile(message, re.I)).filter(visible=True).first
+                if await error.is_visible():
+                    await self.block(clip, await error.inner_text())
+                    return False
             if await voice_overlay_present(page):
+                connecting = page.get_by_text(re.compile(r"^Connecting(?:…|\.\.\.)$", re.I))
+                if await connecting.filter(visible=True).first.is_visible():
+                    await asyncio.sleep(0.25)
+                    continue
                 self.active = True
                 self.failures = 0
                 self.limit_hit = False
-                STATUS.update(voice_limited=False)
+                STATUS.update(voice_limited=False, last_error="")
                 log.info("voice session started")
                 return True
-            if await voice_rate_limited(page):
-                break
-            await asyncio.sleep(0.5)
 
-        self.failures += 1
-        await save_debug(page, "voice-start-timeout")
-        log.warning("voice session did not start within %ss", CFG.voice_start_timeout)
+            setup = page.get_by_role("dialog", name="Set up voice chat", exact=True).first
+            if await setup.is_visible():
+                for label in ("Start voice chat", "Next"):
+                    control = setup.get_by_role("button", name=label, exact=True).first
+                    if label not in setup_steps and await control.is_visible() and await control.is_enabled():
+                        # Use the selected voice and leave optional sharing settings alone.
+                        try:
+                            await control.click(timeout=1500)
+                        except PlaywrightTimeoutError:
+                            break
+                        setup_steps.add(label)
+                        clicked = True
+                        break
+            elif not clicked:
+                button = await find_voice_button(page)
+                if button is not None and await button.is_enabled():
+                    clicked = await click(button)
+                    if not clicked:
+                        break
+            await asyncio.sleep(0.25)
+
+        setup = page.get_by_role("dialog", name="Set up voice chat", exact=True).first
+        if await setup.is_visible():
+            await self.block("setup", "ChatGPT Voice setup could not be completed")
+        elif await page.get_by_role("heading", name="Log in or sign up").first.is_visible():
+            await self.block("login", "ChatGPT Voice requires login")
+        else:
+            await self.block("unavailable", "ChatGPT Voice startup did not complete")
+        await save_debug(page, "voice-start-blocked")
         return False
+
+    async def block(self, clip: str, reason: str) -> None:
+        if self.blocked:
+            return
+        self.blocked = True
+        self.active = False
+        STATUS.update(last_error=reason, voice_active=False)
+        log.warning("%s", reason)
+        if await call_active() is not True:
+            return
+        path = Path(__file__).with_name("announcements") / f"{clip}.wav"
+        try:
+            player = await asyncio.create_subprocess_exec(
+                "paplay", "--device=audiosocket_spk", str(path)
+            )
+        except OSError:
+            log.exception("could not start caller announcement")
+            return
+        try:
+            if await asyncio.wait_for(player.wait(), timeout=15):
+                log.warning("caller announcement failed: %s", clip)
+        except asyncio.TimeoutError:
+            log.warning("caller announcement timed out: %s", clip)
+        finally:
+            if player.returncode is None:
+                player.kill()
+                await player.wait()
 
     async def _dismiss_rate_limit(self, page) -> None:
         try:
             close = page.locator(
                 '[data-testid="modal-voice-rate-limit"] [data-testid="close-button"]'
             )
-            if await close.count() > 0 and await close.first.is_visible():
+            if await close.first.is_visible():
                 await click(close.first)
-                return
-            await page.keyboard.press("Escape")
         except Exception:
             pass
 
@@ -571,12 +603,17 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                 await voice.recover()
                 on_voice_page = False
 
-            if active and not voice.active:
+            if not active:
+                voice.blocked = False
+                if on_voice_page and not voice.active:
+                    on_voice_page = not await voice.end()
+
+            if active and voice.blocked:
+                if await voice_overlay_present(page):
+                    on_voice_page = not await voice.end()
+            elif active and not voice.active:
                 if CFG.require_login and login_state != "in":
-                    log.warning("call active but not logged in; cannot start voice")
-                    if failures == 0:
-                        await save_debug(page, "call-without-login")
-                    failures += 1
+                    await voice.block("login", "ChatGPT Voice requires login")
                 else:
                     if not on_voice_page:
                         # One navigation per call. While a call is active
@@ -601,7 +638,7 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                             ready=True,
                             voice_sessions_started=sessions,
                         )
-                    elif on_voice_page and not voice.limit_hit:
+                    elif on_voice_page and not voice.blocked and not voice.limit_hit:
                         failures += 1
 
             elif not active and voice.active:
