@@ -45,6 +45,13 @@ session runs between calls. Verified against the live site:
 - **No login required to test**: the anonymous page offers a single
   **Tap to talk** button. One tap starts a GPT-Live session; no tap is needed
   again until the session is ended.
+- Camoufox's generated media-device list must stay off
+  (`mediaDevices:enabled=False` in the launch config): the voice session
+  picks its microphone from `enumerateDevices()`, and with the spoofed list
+  it attaches a fake device and sends zero audio (measured via
+  `about:webrtc`: outbound-rtp `0.00 packetsSent/s` while plain
+  `getUserMedia` still captured the caller). The container's real devices
+  are `AudioSocket_Mic`/`AudioSocket_Spk` from the audio service.
 - The live overlay is a `div[data-testid="avatar-overlay-voice-orb"]` orb
   (`data-realtime-voice-orb`), rendered without ids or stable testids on its
   controls; the orb element itself is the session marker.

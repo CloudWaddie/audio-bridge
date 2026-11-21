@@ -671,6 +671,13 @@ async def run(stop: asyncio.Event) -> None:
                 "os": CFG.os,
                 "block_webrtc": False,  # the voice session needs WebRTC
                 "disable_coop": True,   # lets Turnstile's iframe be clicked
+                # Real PulseAudio devices, not camoufox's generated fake
+                # list. The voice session picks its microphone from
+                # enumerateDevices(); with the fake list the outbound track
+                # attaches to a spoofed device and sends zero frames
+                # (measured: about:webrtc outbound-rtp 0.00 packetsSent/s
+                # while plain getUserMedia captured the caller fine).
+                "config": {"mediaDevices:enabled": False},
                 "firefox_user_prefs": FIREFOX_PREFS,
             }
             if not CFG.headless:
