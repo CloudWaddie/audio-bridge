@@ -36,8 +36,11 @@ RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
 # fpgen stores its model inside the installed package directory. pip
 # installed it as root, so hand just that package to the runtime user; the
-# browser cache already lives in the camoufox home.
-RUN FPGEN_DIR=$(python3 -c "import fpgen, os; print(os.path.dirname(fpgen.__file__))") \
+# browser cache already lives in the camoufox home. pip show locates the
+# package without importing it: importing fpgen has the side effect of
+# starting a model download.
+RUN FPGEN_DIR="$(python3 -m pip show fpgen | sed -n 's/^Location: //p')/fpgen" \
+    && test -d "$FPGEN_DIR" \
     && chown -R camoufox:audiosocket "$FPGEN_DIR"
 
 # Download the pinned browser build at image build time. Must run as the user
