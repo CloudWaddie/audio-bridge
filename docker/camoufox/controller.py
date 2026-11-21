@@ -301,11 +301,10 @@ async def detect_login(page) -> str:
 async def voice_overlay_present(page) -> bool:
     """Best-effort check that a voice session overlay is on the page.
 
-    The normal chat page contains unrelated "close" buttons, so a bare
-    end-control match is not enough. Require one of:
+    Only two signals count, both verified against the live site:
       - an audio element driven by a MediaStream and playing,
-      - a non-button overlay container carrying a voice data-testid,
-      - the conjunction of a mute control AND an end control being visible.
+      - the live orb container (exact testid; the entry page also contains
+        voice-branded marketing elements that must not match).
     """
     try:
         playing = await page.evaluate(
@@ -318,12 +317,9 @@ async def voice_overlay_present(page) -> bool:
         )
         if playing:
             return True
-        if await page.locator('div[data-testid*="voice" i]').count() > 0:
-            return True
-        mic = await page.locator('button[aria-label*="mute" i]').count() > 0
-        if not mic:
-            return False
-        return await _first_visible(page, VOICE_END_SELECTORS) is not None
+        return await page.locator(
+            'div[data-testid="avatar-overlay-voice-orb"]'
+        ).count() > 0
     except Exception:
         return False
 
@@ -492,11 +488,16 @@ async def session_loop(context, stop: asyncio.Event) -> None:
             if not active and not voice.active and await voice_overlay_present(page):
                 # A stray overlay (page reloaded into voice mode, or the
                 # session leaked): close it so the allowance is not burned
-                # between calls.
+                # between calls. If it will not close, reload once instead
+                # of thrashing the page every poll.
                 log.info("closing stray voice overlay between calls")
                 await voice.recover()
-                if not await voice_overlay_present(page):
-                    voice.active = False
+                if await voice_overlay_present(page):
+                    try:
+                        await page.goto(CFG.url, wait_until="domcontentloaded", timeout=60_000)
+                        log.info("stray overlay would not close; reloaded the page")
+                    except Exception as exc:
+                        log.warning("could not reload after failed cleanup: %s", exc)
 
             if active and not voice.active:
                 if CFG.require_login and login_state != "in":
