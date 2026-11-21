@@ -132,7 +132,7 @@ func (s *Session) Reject(reason string) {
 // PlayPrompt plays a baked prompt to the caller, best effort. It is meant
 // for paths where no audio endpoint runs, such as the busy rejection.
 func (s *Session) PlayPrompt(name string) {
-	pcm, ok := prompts.Get(name)
+	pcm, ok := prompts.AtRate(name, s.cfg.CallRate)
 	if !ok {
 		return
 	}
@@ -197,16 +197,12 @@ func (s *Session) Run(ctx context.Context) error {
 	// The connected prompt plays before the endpoint starts so it reaches the
 	// caller unmixed and the endpoint stream begins cleanly afterwards.
 	if s.cfg.Prompts {
-		if pcm, ok := prompts.Get(prompts.Connected); ok {
-			s.playPrompt(pcm)
-		}
+		s.PlayPrompt(prompts.Connected)
 	}
 
 	if err := s.ep.Start(runCtx, s.enqueueOutbound); err != nil {
 		if s.cfg.Prompts {
-			if pcm, ok := prompts.Get(prompts.Error); ok {
-				s.playPrompt(pcm)
-			}
+			s.PlayPrompt(prompts.Error)
 		}
 		s.setError(err)
 		return fmt.Errorf("start audio endpoint: %w", err)
