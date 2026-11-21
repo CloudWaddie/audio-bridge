@@ -61,6 +61,7 @@ func run() error {
 			FrameDuration:     cfg.FrameDuration,
 			CallRate:          cfg.CallRate,
 			CollectAudioStats: cfg.CollectAudioStats,
+			Prompts:           cfg.Prompts,
 		},
 	}, logger, func() (bridge.Endpoint, error) {
 		return bridge.New(cfg, logger)

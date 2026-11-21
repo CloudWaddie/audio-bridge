@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cloudwaddie/audiosocket-bridge/internal/bridge"
+	"github.com/cloudwaddie/audiosocket-bridge/internal/prompts"
 )
 
 // ServerConfig configures the AudioSocket listener.
@@ -138,6 +139,9 @@ func (s *Server) handle(conn net.Conn) {
 	default:
 		s.rejected.Add(1)
 		s.log.Warn("call rejected: another call is active", "uuid", sess.UUID())
+		if s.cfg.Session.Prompts {
+			sess.PlayPrompt(prompts.Busy)
+		}
 		sess.Reject("busy")
 		return
 	}

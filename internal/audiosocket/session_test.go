@@ -13,9 +13,14 @@ import (
 
 	"github.com/cloudwaddie/audiosocket-bridge/internal/bridge"
 	"github.com/cloudwaddie/audiosocket-bridge/internal/config"
+	"github.com/cloudwaddie/audiosocket-bridge/internal/prompts"
 )
 
 func newTestServer(t *testing.T, uuidTimeout time.Duration) (*Server, func()) {
+	return newTestServerWithOpts(t, uuidTimeout, false, 20*time.Millisecond)
+}
+
+func newTestServerWithOpts(t *testing.T, uuidTimeout time.Duration, prompts bool, frameDur time.Duration) (*Server, func()) {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -29,9 +34,10 @@ func newTestServer(t *testing.T, uuidTimeout time.Duration) (*Server, func()) {
 			MaxFrameBytes:     4096,
 			ReadBufferBytes:   4096,
 			OutQueueFrames:    50,
-			FrameDuration:     20 * time.Millisecond,
+			FrameDuration:     frameDur,
 			CallRate:          8000,
 			CollectAudioStats: true,
+			Prompts:           prompts,
 		},
 	}, log, func() (bridge.Endpoint, error) {
 		return bridge.New(config.Config{Mode: config.ModeEcho}, log)
@@ -212,5 +218,100 @@ func TestGracefulShutdownEndsCall(t *testing.T) {
 	}
 	if _, _, err := ReadFrame(r, 4096, nil); err == nil {
 		t.Fatal("expected the call to be closed on shutdown")
+	}
+}
+
+func TestConnectedPromptPlaysBeforeEcho(t *testing.T) {
+	// 2 ms frames keep the ~2.7 s prompt fast in tests.
+	srv, _ := newTestServerWithOpts(t, time.Second, true, 2*time.Millisecond)
+	conn, r := dialCall(t, srv.Addr())
+	sendUUID(t, conn)
+
+	prompt, ok := prompts.Get(prompts.Connected)
+	if !ok {
+		t.Fatal("connected prompt missing")
+	}
+	var got []byte
+	frames := 0
+	for len(got) < len(prompt) {
+		kind, payload := readFrame(t, r, conn)
+		if kind != KindAudio {
+			t.Fatalf("prompt frame %d kind = %v", frames, kind)
+		}
+		got = append(got, payload...)
+		frames++
+		if frames > 2000 {
+			t.Fatal("prompt playback did not finish")
+		}
+	}
+	if !bytes.Equal(got[:len(prompt)], prompt) {
+		t.Fatal("prompt audio was altered in transit")
+	}
+
+	// After the prompt the call behaves normally: echo.
+	tone := testTone(160)
+	if _, err := conn.Write(AppendFrame(nil, KindAudio, tone)); err != nil {
+		t.Fatalf("write audio: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("echo of the tone never arrived after the prompt")
+		}
+		kind, payload := readFrame(t, r, conn)
+		if kind == KindAudio && bytes.Equal(payload, tone) {
+			break
+		}
+	}
+
+	snap := srv.Snapshot()
+	if snap.ActiveCall == nil || snap.ActiveCall.PromptFrames == 0 {
+		t.Fatal("expected prompt frames in the call snapshot")
+	}
+}
+
+func TestBusyPromptPlaysBeforeRejection(t *testing.T) {
+	srv, _ := newTestServerWithOpts(t, time.Second, true, 2*time.Millisecond)
+
+	first, firstReader := dialCall(t, srv.Addr())
+	sendUUID(t, first)
+	first.Write(AppendFrame(nil, KindAudio, testTone(160)))
+	if kind, _ := readFrame(t, firstReader, first); kind != KindAudio {
+		t.Fatalf("first call did not echo, kind=%v", kind)
+	}
+
+	second, secondReader := dialCall(t, srv.Addr())
+	sendUUID(t, second)
+
+	prompt, ok := prompts.Get(prompts.Busy)
+	if !ok {
+		t.Fatal("busy prompt missing")
+	}
+	var got []byte
+	if err := second.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if time.Now().After(deadline) {
+			t.Fatal("busy prompt and error frame never arrived")
+		}
+		kind, payload, err := ReadFrame(secondReader, 4096, nil)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if kind == KindError {
+			if string(payload) != "busy" {
+				t.Fatalf("payload = %q", payload)
+			}
+			break
+		}
+		if kind != KindAudio {
+			t.Fatalf("kind = %v", kind)
+		}
+		got = append(got, payload...)
+	}
+	if len(got) < len(prompt)/2 {
+		t.Fatalf("busy prompt truncated: %d of %d bytes", len(got), len(prompt))
 	}
 }

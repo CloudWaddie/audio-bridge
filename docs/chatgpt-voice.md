@@ -134,11 +134,17 @@ Recovery behavior:
 
 - `pacat`/`parec` and the call loop are supervised by the bridge with
   exponential backoff (existing behavior).
+- The caller hears baked spoken prompts: **connected** (chime + "Connected.
+  You can speak now.") before the call bridges, **error** if the audio
+  backend fails, and **busy** before the second caller is rejected. Set
+  `BRIDGE_PROMPTS=false` to disable; regenerate the clips with
+  `cmd/prompt-tts` (see the command's `-h`).
 - The controller restarts the browser after repeated page failures
   (`CF_PAGE_FAILURES_BEFORE_RESTART`, default 5), closes stray voice
   overlays between calls so the allowance is never burned silently, and
   reloads to a fresh page after every call.
-- A hard cap exists at `BRIDGE_MAX_CALL_DURATION` (default 4 h).
+- The call can run until hangup (`BRIDGE_READ_TIMEOUT=0`,
+  `BRIDGE_MAX_CALL_DURATION=0` by default); set either to bound it.
 - All three containers have Docker healthchecks; Coolify restarts a service
   whose healthcheck fails.
 

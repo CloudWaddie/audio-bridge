@@ -43,6 +43,9 @@ type Config struct {
 	// CollectAudioStats enables aggregate RMS/peak metering. Audio content is
 	// never logged or stored.
 	CollectAudioStats bool
+	// Prompts plays the baked call prompts (connected, error, busy) to the
+	// caller.
+	Prompts bool
 	Virtual           VirtualConfig
 }
 
@@ -97,6 +100,7 @@ func Load() (Config, error) {
 		MaxCallDuration:   l.duration("BRIDGE_MAX_CALL_DURATION", 0),
 		ShutdownTimeout:   l.duration("BRIDGE_SHUTDOWN_TIMEOUT", 10*time.Second),
 		CollectAudioStats: l.boolean("BRIDGE_COLLECT_AUDIO_STATS", true),
+		Prompts:           l.boolean("BRIDGE_PROMPTS", true),
 		Virtual: VirtualConfig{
 			PlaybackSink:      l.str("BRIDGE_PA_PLAYBACK_SINK", "audiosocket_mic"),
 			CaptureSource:     l.str("BRIDGE_PA_CAPTURE_SOURCE", "audiosocket_spk.monitor"),

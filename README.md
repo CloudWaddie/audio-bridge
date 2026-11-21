@@ -60,6 +60,9 @@ Properties:
   stream stays continuous.
 - Bounded queues drop the oldest audio on overflow, so latency cannot grow
   without limit. Drops are counted, not logged per frame.
+- Spoken call prompts (connected, error, busy) are baked into the binary and
+  play at real-time pace to the caller before bridging starts; regenerate
+  them with `cmd/prompt-tts` against any OpenAI-compatible TTS endpoint.
 - Structured JSON logging. Raw audio is never logged or written to disk.
 - Graceful shutdown: stop accepting, cancel the call, close the socket, wait
   with a timeout.
@@ -141,6 +144,7 @@ Environment only. All values can live in `.env`; see `.env.example`.
 | `BRIDGE_MAX_CALL_DURATION` | `0` | Hard call limit, `0` disables |
 | `BRIDGE_SHUTDOWN_TIMEOUT` | `10s` | Graceful shutdown budget |
 | `BRIDGE_COLLECT_AUDIO_STATS` | `true` | RMS/peak metering (no audio kept) |
+| `BRIDGE_PROMPTS` | `true` | Play spoken connected/error/busy prompts |
 | `BRIDGE_PA_PLAYBACK_SINK` | `audiosocket_mic` | Sink for phone audio |
 | `BRIDGE_PA_CAPTURE_SOURCE` | `audiosocket_spk.monitor` | Source to capture |
 | `BRIDGE_PA_DEVICE_RATE` | `8000` | Device rate; differs → internal SRC |
@@ -215,8 +219,8 @@ exten => 7000,1,Answer()
 | `/metrics` | Prometheus text: readiness, calls, frames, drops, underruns |
 
 The active call snapshot includes frame and byte counts per direction, dropped
-frames, DTMF digits, and last RMS / peak level in dBFS. Levels are aggregates;
-audio content is never stored.
+frames, DTMF digits, prompt frames, and last RMS / peak level in dBFS. Levels
+are aggregates; audio content is never stored.
 
 ## Security and privacy
 
@@ -261,6 +265,7 @@ Layout:
 ```
 cmd/audiosocket-bridge    service entry point
 cmd/audiosocket-tester    protocol and echo verification client
+cmd/prompt-tts            bakes call prompts from a TTS endpoint
 internal/audiosocket      framing, session, single-call server
 internal/bridge           Endpoint interface, echo and virtual backends
 internal/audio            PCM helpers, bounded buffers, frame queue
@@ -268,6 +273,7 @@ internal/audio/resample   streaming band-limited resampler
 internal/config           environment configuration and validation
 internal/health           health, stats and metrics HTTP endpoints
 internal/logging          structured logger and subprocess log capture
+internal/prompts          baked call prompts (embedded PCM assets)
 docker/audio              PulseAudio sidecar with virtual devices
 docker/camoufox          headless Camoufox driving chatgpt.com Voice Mode
 ```

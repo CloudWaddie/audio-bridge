@@ -16,6 +16,7 @@ import (
 
 	"github.com/cloudwaddie/audiosocket-bridge/internal/audio"
 	"github.com/cloudwaddie/audiosocket-bridge/internal/bridge"
+	"github.com/cloudwaddie/audiosocket-bridge/internal/prompts"
 )
 
 // SessionConfig holds the per-connection tunables.
@@ -30,6 +31,9 @@ type SessionConfig struct {
 	FrameDuration     time.Duration
 	CallRate          int
 	CollectAudioStats bool
+	// Prompts plays the baked call prompts (connected, error, busy) to the
+	// caller.
+	Prompts bool
 }
 
 // Session owns a single AudioSocket call. One session is served by one
@@ -55,6 +59,7 @@ type Session struct {
 	inBytes     atomic.Uint64
 	outFrames   atomic.Uint64
 	outBytes    atomic.Uint64
+	promptFrames atomic.Uint64
 	dtmfCount   atomic.Uint64
 	unsupported atomic.Uint64
 	malformed   atomic.Uint64
@@ -124,6 +129,54 @@ func (s *Session) Reject(reason string) {
 	_, _ = s.conn.Write(buf)
 }
 
+// PlayPrompt plays a baked prompt to the caller, best effort. It is meant
+// for paths where no audio endpoint runs, such as the busy rejection.
+func (s *Session) PlayPrompt(name string) {
+	pcm, ok := prompts.Get(name)
+	if !ok {
+		return
+	}
+	s.playPrompt(pcm)
+}
+
+// playPrompt writes prompt PCM to the peer, one frame per frame interval,
+// so the caller hears it at real-time speed. Errors end the playback.
+func (s *Session) playPrompt(pcm []byte) {
+	if len(pcm) == 0 {
+		return
+	}
+	frameBytes := s.frameBytes()
+	buf := make([]byte, 0, HeaderSize+frameBytes)
+	for off := 0; off < len(pcm); off += frameBytes {
+		end := off + frameBytes
+		if end > len(pcm) {
+			end = len(pcm)
+		}
+		if err := s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)); err != nil {
+			return
+		}
+		buf = AppendFrame(buf[:0], s.audioKind, pcm[off:end])
+		if _, err := s.conn.Write(buf); err != nil {
+			return
+		}
+		s.outFrames.Add(1)
+		s.outBytes.Add(uint64(end - off))
+		s.promptFrames.Add(1)
+		time.Sleep(s.cfg.FrameDuration)
+	}
+	_ = s.conn.SetWriteDeadline(time.Time{})
+}
+
+// frameBytes returns the outbound frame size in bytes.
+func (s *Session) frameBytes() int {
+	bytes := int(int64(s.cfg.CallRate) * s.cfg.FrameDuration.Milliseconds() / 1000) * 2
+	if bytes < 2 {
+		// Degenerate config guard: 20 ms at 8 kHz.
+		return 320
+	}
+	return bytes
+}
+
 // Run serves the call until the peer hangs up, the context is cancelled or the
 // maximum call duration is reached.
 func (s *Session) Run(ctx context.Context) error {
@@ -141,7 +194,20 @@ func (s *Session) Run(ctx context.Context) error {
 		defer cancel()
 	}
 
+	// The connected prompt plays before the endpoint starts so it reaches the
+	// caller unmixed and the endpoint stream begins cleanly afterwards.
+	if s.cfg.Prompts {
+		if pcm, ok := prompts.Get(prompts.Connected); ok {
+			s.playPrompt(pcm)
+		}
+	}
+
 	if err := s.ep.Start(runCtx, s.enqueueOutbound); err != nil {
+		if s.cfg.Prompts {
+			if pcm, ok := prompts.Get(prompts.Error); ok {
+				s.playPrompt(pcm)
+			}
+		}
 		s.setError(err)
 		return fmt.Errorf("start audio endpoint: %w", err)
 	}
@@ -363,6 +429,7 @@ type CallSnapshot struct {
 	DTMF            uint64        `json:"dtmf_digits"`
 	Unsupported     uint64        `json:"unsupported_frames"`
 	Malformed       uint64        `json:"malformed_frames"`
+	PromptFrames    uint64        `json:"prompt_frames"`
 	LastRMSDBFS     *float64      `json:"last_rms_dbfs,omitempty"`
 	PeakDBFS        *float64      `json:"peak_dbfs,omitempty"`
 	LastError       string        `json:"last_error,omitempty"`
@@ -385,6 +452,7 @@ func (s *Session) Snapshot() CallSnapshot {
 		DTMF:            s.dtmfCount.Load(),
 		Unsupported:     s.unsupported.Load(),
 		Malformed:       s.malformed.Load(),
+		PromptFrames:    s.promptFrames.Load(),
 	}
 	if s.ep != nil {
 		snap.Endpoint = s.ep.Name()
