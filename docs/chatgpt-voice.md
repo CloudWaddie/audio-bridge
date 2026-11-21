@@ -165,9 +165,13 @@ docker compose up -d camoufox
 
 ## Limits and honest caveats
 
-- **Voice usage is plan-limited** (anonymous: small free allowance; Plus:
-  ~3 h per rolling 24 h). Sessions end with the call and the page reloads,
-  so idle time is not billed.
+- **Voice usage is plan-limited** (anonymous: a small free allowance that
+  today's testing can exhaust — ChatGPT then shows a
+  `modal-voice-rate-limit` dialog, which the controller recognizes, closes
+  and backs off from for 10 minutes; Plus: ~3 h per rolling 24 h under
+  your login). Sessions end with the call and the page reloads, so idle
+  time is not billed. When `/statusz` shows `"voice_limited": true`, either
+  wait for the free-tier reset or complete the one-time login.
 - **One voice conversation at a time** — matches the bridge's one-call slot;
   a second caller gets a busy signal from the existing implementation.
 - **Firefox support**: OpenAI officially lists Chrome/Safari/Edge for web

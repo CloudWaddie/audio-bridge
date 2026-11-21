@@ -123,6 +123,7 @@ class Status:
             "logged_in": False,
             "login_state": "unknown",
             "voice_active": False,
+            "voice_limited": False,
             "call_active": False,
             "bridge_up": False,
             "page_url": "",
@@ -205,10 +206,12 @@ async def call_active() -> bool | None:
 # --------------------------------------------------------------------------
 
 VOICE_BUTTON_SELECTORS = [
+    # Composer entry, measured on the live site (anonymous and logged-in).
+    'button[aria-label="Start Voice"]',
     'button[data-testid*="voice" i]',
     'button[aria-label*="voice" i]',
-    # Anonymous ?mode=voice page: the entry control has no id, no testid and
-    # no aria-label; its stable surface is the button text.
+    # Anonymous ?mode=voice landing page: the entry control has no id, no
+    # testid and no aria-label; its stable surface is the button text.
     'button:has-text("Tap to talk")',
 ]
 
@@ -222,16 +225,29 @@ VOICE_END_SELECTORS = [
 
 END_NAME_RE = re.compile(r"end.*(chat|call|voice)|close.*(chat|call|voice)", re.I)
 
-LOGIN_MARKERS = [
+# Anonymous sessions also show the composer, so its presence alone proves
+# nothing. These markers only count as logged in when the LOGOUT_MARKERS are
+# absent.
+COMPOSER_MARKERS = [
     "#prompt-textarea",
     'div[id="composer-background"]',
 ]
 
 LOGOUT_MARKERS = [
     'button[data-testid="login-button"]',
+    'button[data-testid="signup-button"]',
     'a[data-testid="login-link"]',
     'button[data-testid*="login" i]',
 ]
+
+VOICE_RATE_LIMIT_SELECTORS = [
+    '[data-testid="modal-voice-rate-limit"]',
+    '[data-testid="blocking-initial-modals-done"] ~ [data-testid="close-button"]',
+]
+
+# Quiet period after the voice rate-limit modal appears (anonymous free
+# tier exhausted); retrying sooner just reopens the modal.
+RATE_LIMIT_BACKOFF_S = 600.0
 
 
 async def _first_visible(page, selectors: list[str], role: tuple[str, re.Pattern] | None = None):
@@ -284,18 +300,29 @@ async def detect_login(page) -> str:
     try:
         if "/auth/login" in page.url:
             return "out"
-        for marker in LOGIN_MARKERS:
-            if await page.locator(marker).count() > 0:
-                return "in"
         for marker in LOGOUT_MARKERS:
             if await page.locator(marker).count() > 0:
                 return "out"
+        for marker in COMPOSER_MARKERS:
+            if await page.locator(marker).count() > 0:
+                return "in"
         link = page.get_by_role("link", name=re.compile(r"log ?in", re.I))
         if await link.count() > 0:
             return "out"
     except Exception:
         return "unknown"
     return "unknown"
+
+
+async def voice_rate_limited(page) -> bool:
+    """True when the voice rate-limit modal is on the page."""
+    try:
+        for selector in VOICE_RATE_LIMIT_SELECTORS:
+            if await page.locator(selector).count() > 0:
+                return True
+        return False
+    except Exception:
+        return False
 
 
 async def voice_overlay_present(page) -> bool:
@@ -364,9 +391,14 @@ class VoiceController:
         self.page = page
         self.active = False
         self.failures = 0
+        self.limit_hit = False
+        self.limit_until = 0.0
 
     async def start(self) -> bool:
         page = self.page
+        if time.monotonic() < self.limit_until:
+            # Quiet period after the rate-limit modal; do not hammer.
+            return False
         if await voice_overlay_present(page):
             # The page can open straight into a live voice session (for
             # example ?mode=voice). Nothing to click.
@@ -374,6 +406,20 @@ class VoiceController:
             self.failures = 0
             log.info("voice session already active on the page")
             return True
+        if await voice_rate_limited(page):
+            await self._dismiss_rate_limit(page)
+            self.limit_hit = True
+            self.limit_until = time.monotonic() + RATE_LIMIT_BACKOFF_S
+            STATUS.update(
+                voice_limited=True,
+                last_error="voice rate limited (anonymous free tier); "
+                           "log in via noVNC or wait for the reset",
+            )
+            log.warning(
+                "voice rate-limited; backing off for %ss",
+                RATE_LIMIT_BACKOFF_S,
+            )
+            return False
         button = await find_voice_button(page)
         if button is None:
             if self.failures == 0 or self.failures % 10 == 0:
@@ -390,14 +436,30 @@ class VoiceController:
             if await voice_overlay_present(page):
                 self.active = True
                 self.failures = 0
+                self.limit_hit = False
+                STATUS.update(voice_limited=False)
                 log.info("voice session started")
                 return True
+            if await voice_rate_limited(page):
+                break
             await asyncio.sleep(0.5)
 
         self.failures += 1
         await save_debug(page, "voice-start-timeout")
         log.warning("voice session did not start within %ss", CFG.voice_start_timeout)
         return False
+
+    async def _dismiss_rate_limit(self, page) -> None:
+        try:
+            close = page.locator(
+                '[data-testid="modal-voice-rate-limit"] [data-testid="close-button"]'
+            )
+            if await close.count() > 0 and await close.first.is_visible():
+                await click(close.first)
+                return
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
 
     async def end(self) -> bool:
         page = self.page
@@ -512,7 +574,7 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                         ready=True,
                         voice_sessions_started=sessions,
                     )
-                else:
+                elif not voice.limit_hit:
                     failures += 1
 
             elif not active and voice.active:
