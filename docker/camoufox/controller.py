@@ -331,6 +331,34 @@ async def voice_rate_limited(page) -> bool:
         return False
 
 
+VOICE_ERRORS = (
+    ("microphone", r"^Microphone permission denied$"),
+    ("load_error", r"^Voice unavailable(?: [—–-] reload to try again)?$"),
+    ("lesson", r"^You can['’]t start Voice from here during a lesson yet\."),
+    ("unavailable", r"^(?:Voice chat couldn['’]t start|Unable to start voice chat)$"),
+)
+
+
+async def voice_start_blocker(page) -> tuple[str, str] | None:
+    for clip, pattern in VOICE_ERRORS:
+        name = re.compile(pattern, re.I)
+        button = page.get_by_role("button", name=name).filter(visible=True).first
+        if await button.is_visible():
+            return clip, await button.get_attribute("aria-label") or await button.inner_text()
+        message = page.get_by_text(name).filter(visible=True).first
+        if await message.is_visible():
+            return clip, await message.inner_text()
+
+    if (await page.get_by_text("Log in or sign up", exact=True).filter(visible=True).first.is_visible()
+            or urlsplit(page.url).path.rstrip("/") == "/auth/login"):
+        return "login", "ChatGPT Voice requires login"
+    verification = re.compile(r"^(?:Verify you are human|Just a moment)(?:[.!…]+)?$", re.I)
+    if (verification.fullmatch(await page.title())
+            or await page.get_by_text(verification).filter(visible=True).first.is_visible()):
+        return "verification", "ChatGPT is asking for verification"
+    return None
+
+
 async def voice_overlay_present(page) -> bool:
     """Best-effort check that a voice session overlay is on the page.
 
@@ -413,28 +441,24 @@ class VoiceController:
             return False
         deadline = time.monotonic() + CFG.voice_start_timeout
         clicked = False
+        entry_seen = False
+        connecting_seen = False
         setup_steps = set()
         while time.monotonic() < deadline:
             if await voice_rate_limited(page):
-                await self._dismiss_rate_limit(page)
-                self.limit_hit = True
-                self.limit_until = time.monotonic() + RATE_LIMIT_BACKOFF_S
-                STATUS.update(voice_limited=True)
-                await self.block("limit", "ChatGPT Voice usage limit reached")
+                await self.handle_rate_limit()
                 return False
-            for clip, message in (
-                ("microphone", r"^Microphone permission denied$"),
-                ("unavailable", r"^(?:Voice chat couldn['’]t start|Unable to start voice chat|Voice unavailable(?: [—–-] reload to try again)?)$"),
-            ):
-                error = page.get_by_text(re.compile(message, re.I)).filter(visible=True).first
-                if await error.is_visible():
-                    await self.block(clip, await error.inner_text())
-                    return False
+            blocker = await voice_start_blocker(page)
+            if blocker:
+                await self.block(*blocker)
+                return False
+
+            connecting = page.get_by_text(re.compile(r"^Connecting(?:…|\.\.\.)?$", re.I))
+            if await connecting.filter(visible=True).first.is_visible():
+                connecting_seen = True
+                await asyncio.sleep(0.25)
+                continue
             if await voice_overlay_present(page):
-                connecting = page.get_by_text(re.compile(r"^Connecting(?:…|\.\.\.)$", re.I))
-                if await connecting.filter(visible=True).first.is_visible():
-                    await asyncio.sleep(0.25)
-                    continue
                 self.active = True
                 self.failures = 0
                 self.limit_hit = False
@@ -460,19 +484,23 @@ class VoiceController:
                         break
             elif not clicked:
                 button = await find_voice_button(page)
-                if button is not None and await button.is_enabled():
-                    clicked = await click(button)
-                    if not clicked:
-                        break
+                if button is not None:
+                    entry_seen = True
+                    if await button.is_enabled():
+                        clicked = await click(button)
+                        if not clicked:
+                            break
             await asyncio.sleep(0.25)
 
         setup = page.get_by_role("dialog", name="Set up voice chat", exact=True).first
         if await setup.is_visible():
             await self.block("setup", "ChatGPT Voice setup could not be completed")
-        elif await page.get_by_role("heading", name="Log in or sign up").first.is_visible():
-            await self.block("login", "ChatGPT Voice requires login")
+        elif connecting_seen or clicked:
+            await self.block("connection_timeout", "ChatGPT Voice did not connect in time")
+        elif entry_seen or await page.get_by_role("button", name="Loading voice", exact=True).first.is_visible():
+            await self.block("load_error", "ChatGPT Voice start control did not become available")
         else:
-            await self.block("unavailable", "ChatGPT Voice startup did not complete")
+            await self.block("voice_missing", "ChatGPT Voice start button is missing")
         await save_debug(page, "voice-start-blocked")
         return False
 
@@ -505,6 +533,13 @@ class VoiceController:
             if player.returncode is None:
                 player.kill()
                 await player.wait()
+
+    async def handle_rate_limit(self) -> None:
+        await self._dismiss_rate_limit(self.page)
+        self.limit_hit = True
+        self.limit_until = time.monotonic() + RATE_LIMIT_BACKOFF_S
+        STATUS.update(voice_limited=True)
+        await self.block("limit", "ChatGPT Voice usage limit reached")
 
     async def _dismiss_rate_limit(self, page) -> None:
         try:
@@ -634,14 +669,19 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                         # again each poll would interrupt hydration, so
                         # retry voice.start() on the same page instead.
                         try:
-                            await page.goto(
+                            response = await page.goto(
                                 CFG.voice_url, wait_until="domcontentloaded", timeout=60_000
                             )
+                            if response is not None and response.status >= 400:
+                                blocker = await voice_start_blocker(page)
+                                await voice.block(*(blocker or (
+                                    "page_error", f"ChatGPT Voice page returned HTTP {response.status}"
+                                )))
                             on_voice_page = True
                             log.info("opened %s for the call", CFG.voice_url)
                         except Exception as exc:
-                            failures += 1
                             log.warning("could not open the voice page: %s", exc)
+                            await voice.block("page_error", "Could not open the ChatGPT Voice page")
                     if on_voice_page and await voice.start():
                         sessions = STATUS.snapshot()["voice_sessions_started"] + 1
                         STATUS.update(
@@ -669,8 +709,12 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                     on_voice_page = False
 
             elif active and voice.active:
-                # Watch for the overlay disappearing mid-call.
-                if not await voice_overlay_present(page):
+                # The limit can arrive while the overlay is still visible.
+                if await voice_rate_limited(page):
+                    await voice.handle_rate_limit()
+                elif blocker := await voice_start_blocker(page):
+                    await voice.block(*blocker)
+                elif not await voice_overlay_present(page):
                     log.info("voice overlay vanished mid-call; restarting voice")
                     voice.active = False
                     if await voice.start():
