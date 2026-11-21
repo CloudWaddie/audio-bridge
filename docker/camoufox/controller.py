@@ -207,11 +207,14 @@ def _fetch_bridge_stats() -> dict | None:
 
 
 async def call_active() -> bool | None:
-    """True/False when the bridge answers, None when it does not."""
+    """True once the phone call's audio endpoint has started."""
     stats = await asyncio.to_thread(_fetch_bridge_stats)
     if stats is None:
         return None
-    return stats.get("active_call") is not None
+    call = stats.get("active_call")
+    # Go registers the call before playing the opening prompt. While the
+    # endpoint is still starting, started_at is the zero timestamp.
+    return call is not None and call.get("started_at") != "0001-01-01T00:00:00Z"
 
 
 # --------------------------------------------------------------------------
@@ -399,6 +402,7 @@ class VoiceController:
         self.limit_hit = False
         self.limit_until = 0.0
         self.blocked = False
+        self.ready_announced = False
 
     async def start(self) -> bool:
         page = self.page
@@ -436,6 +440,9 @@ class VoiceController:
                 self.limit_hit = False
                 STATUS.update(voice_limited=False, last_error="")
                 log.info("voice session started")
+                if not self.ready_announced:
+                    self.ready_announced = True
+                    await self._announce("ready")
                 return True
 
             setup = page.get_by_role("dialog", name="Set up voice chat", exact=True).first
@@ -476,6 +483,9 @@ class VoiceController:
         self.active = False
         STATUS.update(last_error=reason, voice_active=False)
         log.warning("%s", reason)
+        await self._announce(clip)
+
+    async def _announce(self, clip: str) -> None:
         if await call_active() is not True:
             return
         path = Path(__file__).with_name("announcements") / f"{clip}.wav"
@@ -605,6 +615,7 @@ async def session_loop(context, stop: asyncio.Event) -> None:
 
             if not active:
                 voice.blocked = False
+                voice.ready_announced = False
                 if on_voice_page and not voice.active:
                     on_voice_page = not await voice.end()
 

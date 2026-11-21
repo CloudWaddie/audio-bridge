@@ -6,7 +6,7 @@
 // resampler the bridge uses at runtime, normalizes the level and writes raw
 // s16le mono PCM:
 //
-//	prompt-tts -text "Connected." -chime connected \
+//	prompt-tts -text "Connecting to ChatGPT." -chime connected \
 //	    -out internal/prompts/assets/connected.pcm
 //
 // The output is checked into the repository and embedded in the bridge

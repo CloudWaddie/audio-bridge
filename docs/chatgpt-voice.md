@@ -104,7 +104,7 @@ out, repeat this procedure.
 ## Making a call
 
 Dial the FreeCall number that reaches the `audiosocket-bridge` dialplan
-extension. A few seconds after connect you hear ChatGPT's greeting. Speak
+extension. Wait for the bridge to say “Ready. You can speak now.” Speak
 normally; this is the same GPT-Live conversation you get on the website,
 including interruptions. Hanging up ends the voice session and the next call
 starts a fresh conversation. The round trip adds roughly 80–250 ms over the
@@ -148,11 +148,13 @@ Recovery behavior:
 
 - `pacat`/`parec` and the call loop are supervised by the bridge with
   exponential backoff (existing behavior).
-- The caller hears baked spoken prompts: **connected** (chime + "Connected.
-  You can speak now.") before the call bridges, **error** if the audio
-  backend fails, and **busy** before the second caller is rejected. Set
-  `BRIDGE_PROMPTS=false` to disable; regenerate the clips with
-  `cmd/prompt-tts` (see the command's `-h`).
+- The bridge plays the chime and “Connecting to ChatGPT” when it accepts
+  the phone call. Camoufox plays “Ready. You can speak now” after Voice
+  starts, or plays an explanation if startup fails.
+- The bridge also plays **error** if the audio backend fails and **busy**
+  before rejecting a second caller. Set `BRIDGE_PROMPTS=false` to disable
+  the bridge's prompts. Regenerate those clips with `cmd/prompt-tts`
+  (see the command's `-h`).
 - The controller restarts the browser after repeated page failures
   (`CF_PAGE_FAILURES_BEFORE_RESTART`, default 5), closes stray voice
   overlays between calls so the allowance is never burned silently, and
