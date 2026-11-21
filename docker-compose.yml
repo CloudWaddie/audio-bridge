@@ -58,6 +58,55 @@ services:
       retries: 5
       start_period: 5s
 
+  # Camoufox (anti-detect Firefox) driving chatgpt.com Voice Mode. Watches
+  # the bridge health endpoint: phone call arrives -> click Voice, phone call
+  # ends -> end the voice session. The browser uses the audio service's
+  # default source/sink (audiosocket_mic_source / audiosocket_spk), so the
+  # bridge owns all audio routing and resampling.
+  # One-time login: set CF_LOGIN_ONLY=true and reach the desktop through
+  # noVNC on port 6080 (publish it temporarily), then flip back. See
+  # docs/chatgpt-voice.md.
+  camoufox:
+    build: ./docker/camoufox
+    restart: unless-stopped
+    environment:
+      PULSE_SERVER: unix:/pulse/native
+      CF_URL: ${CF_URL:-https://chatgpt.com/?mode=voice}
+      CF_BRIDGE_STATS_URL: ${CF_BRIDGE_STATS_URL:-http://bridge:8080/stats}
+      CF_LOGIN_ONLY: ${CF_LOGIN_ONLY:-false}
+      # Voice works anonymously; set true to only serve calls when logged in.
+      CF_REQUIRE_LOGIN: ${CF_REQUIRE_LOGIN:-false}
+      CF_VNC_ENABLED: ${CF_VNC_ENABLED:-true}
+      CF_VNC_PASSWORD: ${CF_VNC_PASSWORD:-}
+      CF_LOG_LEVEL: ${CF_LOG_LEVEL:-info}
+      # Selector overrides for when OpenAI ships a new DOM:
+      CF_VOICE_SELECTOR: ${CF_VOICE_SELECTOR:-}
+      CF_END_SELECTOR: ${CF_END_SELECTOR:-}
+    volumes:
+      # Session cookies live here; treat the volume as a secret.
+      - camoufox-data:/data
+      - pulse:/pulse
+    shm_size: 1g
+    expose:
+      # Internal only. Publish 6080 briefly for the one-time login, then
+      # remove the mapping.
+      - "6080"
+    depends_on:
+      audio:
+        condition: service_healthy
+      bridge:
+        condition: service_started
+    networks:
+      - voice
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
 networks:
   voice:
     name: ${BRIDGE_NETWORK_NAME:-audiosocket}
@@ -67,3 +116,4 @@ networks:
 
 volumes:
   pulse:
+  camoufox-data:

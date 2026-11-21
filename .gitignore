@@ -9,8 +9,16 @@
 .env
 .env.local
 
+# Local probe tooling (scripts/probe_chatgpt.py)
+.probe-profile/
+scripts/probe-debug/
+
 # Editor and OS noise
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Python bytecode
+__pycache__/
+*.pyc

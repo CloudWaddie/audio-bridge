@@ -81,7 +81,7 @@ func main() {
 					fmt.Printf("unexpected audio kind 0x%02x\n", uint8(kind))
 					continue
 				}
-				firstReply.CompareAndSwap(0, int64(time.Since(start)))
+				firstReply.CompareAndSwap(0, time.Now().UnixNano())
 				receivedFrames.Add(1)
 				receivedBytes.Add(uint64(len(payload)))
 				if rms, _ := level(payload); !math.IsInf(rms, 0) {
@@ -144,7 +144,7 @@ loop:
 	fmt.Printf("frames sent=%d received=%d lost=%d bytes_received=%d read_errors=%d\n",
 		sent, got, lost, receivedBytes.Load(), readErrors.Load())
 	if ts := firstReply.Load(); ts != 0 {
-		fmt.Printf("first reply after %s\n", time.Duration(time.Now().UnixNano()-ts))
+		fmt.Printf("first reply after %s\n", time.Duration(ts-start.UnixNano()))
 	}
 	if v := math.Float64frombits(lastRMSBits.Load()); v != 0 && !math.IsInf(v, 0) {
 		fmt.Printf("last returned frame level: %.1f dBFS\n", v)

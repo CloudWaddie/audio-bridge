@@ -1,8 +1,8 @@
 # Virtual audio pipeline
 
 The virtual mode connects a phone call to a pair of PulseAudio / PipeWire
-devices. The same devices are meant to be used by a headless Chromium running
-ChatGPT Voice later.
+devices. The same devices are used by the headless Camoufox browser that
+drives ChatGPT Voice; see [chatgpt-voice.md](chatgpt-voice.md).
 
 ## Device topology
 
@@ -72,33 +72,21 @@ PipeWire works through `pipewire-pulse`, which provides `pacat` and `parec`.
 > the socket record and play audio. Keep the socket in a private volume or a
 > `0700` directory, and never expose PulseAudio over TCP.
 
-## Future Chromium integration
+## Browser integration
 
-Chromium should run as another container that mounts the same `pulse` volume:
+The `camoufox` service from the compose file runs the browser. It mounts the
+same `pulse` volume, so PulseAudio's defaults route it automatically:
 
-```yaml
-  chromium:
-    image: your-chromium-image
-    environment:
-      PULSE_SERVER: unix:/pulse/native
-    volumes:
-      - pulse:/pulse
-    networks: [voice]
-```
+- Default source `audiosocket_mic_source` carries the caller's voice (the
+  browser's "microphone").
+- Default sink `audiosocket_spk` receives the browser's voice output, which
+  the bridge captures from its monitor.
 
-Then:
-
-- Select `AudioSocket_Mic` as the microphone (it carries the caller's voice).
-- Select `audiosocket_spk` as the output device (the bridge captures it).
-- Disable audio processing that would distort telephony audio:
-  `--disable-features=AudioServiceOutOfProcess` is not required, but
-  `--use-fake-device-for-media-stream` must **not** be used.
-- Allow autoplay for the voice page:
-  `--autoplay-policy=no-user-gesture-required`.
-
-The bridge does not depend on Chromium: in virtual mode it already provides the
-device pair, so the ChatGPT integration can be added as a new
-`internal/bridge` endpoint without touching AudioSocket handling.
+No fake media devices are used; the browser sees real PulseAudio devices.
+Autoplay is allowed through a Firefox pref, and `getUserMedia` is
+auto-granted with the `media.navigator.permission.disabled` pref because
+Playwright cannot grant microphone permission on Firefox. The full flow and
+the one-time login live in [chatgpt-voice.md](chatgpt-voice.md).
 
 ## Latency budget
 

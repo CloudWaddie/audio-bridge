@@ -3,7 +3,7 @@ FROM alpine:3.20
 # The pulseaudio package already creates a "pulse" user, and Alpine ships an
 # "audio" group, so pick a name that collides with neither. The UID matches the
 # bridge user (10001) so both containers can share the /pulse volume.
-RUN apk add --no-cache pulseaudio pulseaudio-utils tini \
+RUN apk add --no-cache pulseaudio pulseaudio-utils tini python3 \
     && addgroup -g 10001 audiosocket \
     && adduser -D -u 10001 -G audiosocket -s /sbin/nologin audiosocket \
     && mkdir -p /pulse \

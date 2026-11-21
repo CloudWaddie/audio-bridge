@@ -161,20 +161,28 @@ docker compose up -d --build
 docker compose logs -f bridge
 ```
 
-The compose file runs two services on a private network named `audiosocket`:
+The compose file runs three services on a private network named `audiosocket`:
 
 - `bridge` – the Go service. It publishes **no** ports; `9092` is only on the
   Docker network. Its health endpoint is reachable inside the network.
 - `audio` – a small PulseAudio server with the two null sinks and the remapped
-  microphone source, sharing a named volume `pulse`.
+  microphone source, sharing a named volume `pulse`. Defaults are pinned to
+  the bridge devices so browsers route without device pickers.
+- `camoufox` – headless Camoufox with a persistent profile driving chatgpt.com
+  Voice Mode. Session cookies live in the `camoufox-data` volume (a secret).
+  It serves its own health endpoints on `8080` and a noVNC desktop on `6080`
+  for the one-time login; `6080` is not published by default.
 
 For Coolify:
 
 1. Create a resource from this repository using the Docker Compose build pack.
 2. Keep `BRIDGE_MODE=echo` for the first deployment and set the other variables
-   from `.env.example`.
+   from `.env.example`. For ChatGPT Voice, switch to `BRIDGE_MODE=virtual`,
+   `BRIDGE_PA_DEVICE_RATE=48000` and follow
+   [docs/chatgpt-voice.md](docs/chatgpt-voice.md) for the one-time login.
 3. Do not add a port mapping for `9092`. Coolify can use the container
-   healthcheck on `/healthz` (port `8080`).
+   healthcheck on `/healthz` (port `8080`). Publish `6080` only briefly for
+   the login, then remove it.
 4. Attach the `audiosocket` network to the MikoPBX container, or set
    `BRIDGE_NETWORK_EXTERNAL=true` and `BRIDGE_NETWORK_NAME=<existing network>`.
 5. Point the MikoPBX dialplan at `bridge:9092`.
@@ -224,23 +232,21 @@ audio content is never stored.
 
 ## Extending to ChatGPT Voice
 
-`internal/bridge` is the seam. The AudioSocket server, protocol handling,
-session lifecycle and statistics only depend on the `bridge.Endpoint`
-interface:
+That extension now exists and ships in this repository. The stack grew a third
+service, `camoufox`: a headless Camoufox browser (anti-detect Firefox) with a
+persistent profile that opens chatgpt.com, logs in once through noVNC, and
+starts/stops the site's Voice Mode in step with the phone call. It listens to
+the bridge's `/stats` endpoint, so no new protocol surface was needed:
 
-```go
-type Endpoint interface {
-    Name() string
-    Start(ctx context.Context, sink Sink) error
-    Write(pcm []byte) error
-    Stats() Stats
-    Close() error
-}
-```
+- `BRIDGE_MODE=virtual` — the existing backend routes call audio into the
+  PulseAudio devices and resamples 8 kHz ↔ 48 kHz.
+- The audio container pins the default source/sink so the browser lands on
+  the right devices.
+- The controller clicks the same **Voice** button a human would. No OpenAI
+  API, no private endpoints.
 
-A future `chromium` endpoint can write call audio into a virtual microphone,
-capture the assistant's reply, and reuse the same pacing and framing code. No
-change to `internal/audiosocket` is required.
+See [docs/chatgpt-voice.md](docs/chatgpt-voice.md) for the one-time login
+procedure, verification steps and the full pipeline description.
 
 ## Development
 
@@ -263,4 +269,5 @@ internal/config           environment configuration and validation
 internal/health           health, stats and metrics HTTP endpoints
 internal/logging          structured logger and subprocess log capture
 docker/audio              PulseAudio sidecar with virtual devices
+docker/camoufox          headless Camoufox driving chatgpt.com Voice Mode
 ```

@@ -17,7 +17,7 @@ chmod 700 "$RUNTIME_DIR"
 SOCKET_DIR="${PULSE_SOCKET_DIR:-/pulse}"
 mkdir -p "$SOCKET_DIR"
 
-exec pulseaudio \
+pulseaudio \
   --daemonize=false \
   --disallow-exit \
   --exit-idle-time=-1 \
@@ -27,4 +27,23 @@ exec pulseaudio \
   --load="module-null-sink sink_name=audiosocket_mic sink_properties=device.description=AudioSocket_Mic" \
   --load="module-null-sink sink_name=audiosocket_spk sink_properties=device.description=AudioSocket_Spk" \
   --load="module-remap-source master=audiosocket_mic.monitor source_name=audiosocket_mic_source source_properties=device.description=AudioSocket_Mic" \
-  --load="module-always-sink"
+  --load="module-always-sink" &
+PA_PID=$!
+
+# Wait for the socket, then pin the defaults so browser clients (Camoufox)
+# land on the right devices without device pickers: Firefox output goes to
+# audiosocket_spk and its microphone capture comes from audiosocket_mic_source
+# (the remapped source carrying caller audio).
+i=0
+while [ ! -S "${SOCKET_DIR}/native" ] && [ $i -lt 100 ]; do
+  sleep 0.1
+  i=$((i + 1))
+done
+if ! pactl set-default-sink audiosocket_spk 2>/dev/null; then
+  echo "warning: could not set default sink" >&2
+fi
+if ! pactl set-default-source audiosocket_mic_source 2>/dev/null; then
+  echo "warning: could not set default source" >&2
+fi
+
+wait "${PA_PID}"
