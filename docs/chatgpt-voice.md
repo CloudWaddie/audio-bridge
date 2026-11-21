@@ -27,9 +27,9 @@ Phone ──FreeCall──▶ MikoPBX ──AudioSocket 8 kHz slin──▶ brid
   source `audiosocket_mic_source`.
 - The **camoufox** container runs Camoufox (anti-detect Firefox) on a private
   Xvfb display with a persistent profile volume. Its controller polls the
-  bridge's `/stats` endpoint: a call arrives → tap **Tap to talk**; the call
-  ends → **End call** → reload to a fresh page, so every call is a new
-  conversation.
+  bridge's `/stats` endpoint: a call arrives → open `?mode=voice` → tap
+  **Tap to talk**; the call ends → leave the voice page, which tears the
+  media session down, so every call is a new conversation.
 - Nothing here uses the OpenAI API or any undocumented private endpoint. It is
   a browser, a web page, and the buttons on it.
 
@@ -46,14 +46,17 @@ session runs between calls. Verified against the live site:
   **Tap to talk** button. One tap starts a GPT-Live session; no tap is needed
   again until the session is ended.
 - The live overlay is a `div[data-testid="avatar-overlay-voice-orb"]` orb
-  with two text-labelled controls: **Mute** and **End call**. None of the
-  voice controls carry ids or aria-labels; the controller finds them by role
-  and text, which survived this DOM.
-- After **End call** the orb element stays in the DOM wrapped in an
+  (`data-realtime-voice-orb`), rendered without ids or stable testids on its
+  controls; the orb element itself is the session marker.
+- After the session ends the orb element stays in the DOM wrapped in an
   `invisible` (visibility:hidden) container, so the controller checks
   visibility, not element count, when deciding whether a session is over.
-- **End call** returns to the idle page. Reloading (or the next tap) starts a
-  *fresh* conversation — this is what makes "new call = new chat" true.
+- Ending = leaving the voice page: navigation tears the media session
+  down. The next call navigates back and starts a *fresh* conversation —
+  this is what makes "new call = new chat" true. (An **End Voice** button
+  exists, but it has no stable testid, and loose "close"/"end" matching
+  hits the sidebar and the composer instead — so the controller never
+  clicks it.)
 - With a **logged-in profile** the same page runs under your plan's Live
   allowance (Plus: ~3 h per rolling 24 h) instead of the anonymous free tier,
   and transcripts land in your chat history.

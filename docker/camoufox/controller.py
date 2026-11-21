@@ -228,12 +228,10 @@ VOICE_BUTTON_SELECTORS = [
 
 VOICE_NAME_RE = re.compile(r"voice|tap to talk", re.I)
 
-VOICE_END_SELECTORS = [
-    'button[data-testid*="close" i]',
-    'button[aria-label*="end" i]',
-    'button[aria-label*="close" i]',
-]
-
+# The session controls are text-labelled ("End call") with no stable
+# testids. Loose attribute matching is unsafe here: "close" also matches
+# the sidebar's close-sidebar-button and "end" the composer's Send, so
+# the end control is located by accessible name only.
 END_NAME_RE = re.compile(r"end.*(chat|call|voice)|close.*(chat|call|voice)", re.I)
 
 # Login detection. Every ChatGPT document embeds the bootstrap session
@@ -297,9 +295,6 @@ async def find_end_control(page):
         locator = page.locator(CFG.end_selector)
         if await locator.count() > 0:
             return locator.first
-    control = await _first_visible(page, VOICE_END_SELECTORS)
-    if control is not None:
-        return control
     return await _first_visible(page, [], role=("button", END_NAME_RE))
 
 
@@ -480,18 +475,25 @@ class VoiceController:
             pass
 
     async def end(self) -> bool:
+        """End the voice session by leaving the voice page.
+
+        Navigation tears down the media connection on both the anonymous
+        and the logged-in session UIs. Measured the hard way: the "End
+        Voice" control has no stable testid, and loose "close"/"end"
+        attribute matches hit the sidebar and the composer instead.
+        """
         page = self.page
-        control = await find_end_control(page)
-        if control is not None:
-            await click(control)
-        else:
-            # Last resort: the overlay also closes on Escape.
-            await page.keyboard.press("Escape")
+        try:
+            await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
+        except Exception as exc:
+            log.warning("could not navigate away from the voice session: %s", exc)
+            return False
 
         deadline = time.monotonic() + CFG.voice_end_timeout
         while time.monotonic() < deadline:
             if not await voice_overlay_present(page):
                 self.active = False
+                STATUS.update(voice_active=False)
                 log.info("voice session ended")
                 return True
             await asyncio.sleep(0.5)
@@ -553,35 +555,21 @@ async def session_loop(context, stop: asyncio.Event) -> None:
             if active is None:
                 # Bridge unreachable: make sure we are not burning the
                 # ChatGPT voice session while nobody is on the line.
+                # voice.recover() ends the session by leaving the voice
+                # page; a failed navigation is retried next poll.
                 if voice.active or await voice_overlay_present(page):
                     await voice.recover()
-                if voice.active:
-                    # No call can be active; return to the idle page.
-                    try:
-                        await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
-                        voice.active = False
-                        on_voice_page = False
-                        STATUS.update(voice_active=False)
-                        log.info("bridge unreachable; idle page opened")
-                    except Exception as exc:
-                        log.warning("could not open the idle page: %s", exc)
+                    on_voice_page = False
                 await asyncio.sleep(CFG.poll_interval)
                 continue
 
             if not active and not voice.active and await voice_overlay_present(page):
-                # A stray overlay (the session leaked, or a reload landed
-                # back in voice mode): close it so the allowance is not
-                # burned between calls. If it will not close, reload to
-                # the idle page instead of thrashing every poll.
+                # A leaked overlay: leaving the page tears it down and
+                # stops the allowance burn; retried next poll if the
+                # navigation fails.
                 log.info("closing stray voice overlay between calls")
                 await voice.recover()
-                if await voice_overlay_present(page):
-                    try:
-                        await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
-                        on_voice_page = False
-                        log.info("stray overlay would not close; reloaded the idle page")
-                    except Exception as exc:
-                        log.warning("could not reload after failed cleanup: %s", exc)
+                on_voice_page = False
 
             if active and not voice.active:
                 if CFG.require_login and login_state != "in":
@@ -617,26 +605,20 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                         failures += 1
 
             elif not active and voice.active:
+                # voice.end() leaves the voice page itself: navigation
+                # tears the session down (no end control to find), and
+                # the next call opens a fresh conversation.
                 ended = await voice.end()
                 if ended:
                     sessions = STATUS.snapshot()["voice_sessions_ended"] + 1
                     STATUS.update(voice_sessions_ended=sessions)
+                    on_voice_page = False
+                    log.info("returned to the idle page after the call")
                 else:
                     failures += 1
-                # Return to the idle page (and as a hard cleanup:
-                # navigating away tears down a voice overlay that
-                # refused to close, and the next call navigates to the
-                # voice page again for a fresh conversation).
-                try:
-                    await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
-                    voice.active = False
+                    # The page state is unknown after a failed goto;
+                    # the next call navigates to the voice page anyway.
                     on_voice_page = False
-                    STATUS.update(voice_active=False)
-                    log.info("returned to the idle page after the call")
-                except Exception as exc:
-                    failures += 1
-                    on_voice_page = False
-                    log.warning("could not open the idle page: %s", exc)
 
             elif active and voice.active:
                 # Watch for the overlay disappearing mid-call.
