@@ -110,6 +110,25 @@ including interruptions. Hanging up ends the voice session and the next call
 starts a fresh conversation. The round trip adds roughly 80–250 ms over the
 phone network (see the latency budget in [audio-pipeline.md](audio-pipeline.md)).
 
+
+### Keypad shortcuts
+
+Press both digits within one second. Your Asterisk AudioSocket channel
+driver must forward DTMF events. A received key increments
+`active_call.dtmf_digits` in the bridge's `/stats` response.
+
+| Keys | Action |
+| --- | --- |
+| `90` | Read the available shortcuts. |
+| `91` | Toggle the caller microphone mute. |
+| `92` | End the current Voice session and start a fresh chat on the same call. |
+| `93` | Speak after the prompt to check whether the input is quiet, audible, or clipping. |
+| `94` | Speak immediately to hear your audio echoed for five seconds. ChatGPT is out of the audio path during the test. |
+| `99` | Read Voice readiness, the bridge sample rate, whether input signal was detected, and whether frames dropped. |
+
+The diagnostics describe the bridge and its audio path. Your phone or
+trunk can negotiate a different codec.
+
 ## Verification before the first call
 
 Prove the audio path end to end **without** involving ChatGPT:

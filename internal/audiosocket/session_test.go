@@ -315,3 +315,57 @@ func TestBusyPromptPlaysBeforeRejection(t *testing.T) {
 		t.Fatalf("busy prompt truncated: %d of %d bytes", len(got), len(prompt))
 	}
 }
+
+func TestKeypadCommandsOverAudioSocket(t *testing.T) {
+	srv, _ := newTestServer(t, time.Second)
+	conn, reader := dialCall(t, srv.Addr())
+	sendUUID(t, conn)
+	tone := testTone(160)
+	send := func(keys string) []byte {
+		t.Helper()
+		var frames []byte
+		for i := range keys {
+			frames = AppendFrame(frames, KindDTMF, []byte{keys[i]})
+		}
+		frames = AppendFrame(frames, KindAudio, tone)
+		if _, err := conn.Write(frames); err != nil {
+			t.Fatal(err)
+		}
+		kind, pcm := readFrame(t, reader, conn)
+		if kind != KindAudio {
+			t.Fatalf("got frame kind %v", kind)
+		}
+		return pcm
+	}
+	if got := send("90919293"); !bytes.Equal(got, make([]byte, len(tone))) {
+		t.Fatal("muted microphone leaked through the endpoint")
+	}
+	if got := send("94"); !bytes.Equal(got, tone) {
+		t.Fatal("the echo test did not return the caller's audio")
+	}
+	send("9199")
+	call := srv.Snapshot().ActiveCall
+	if call == nil || call.MicMuted || !call.EchoActive || call.MicCheckPeak == nil {
+		t.Fatalf("unexpected call state: %+v", call)
+	}
+	for digit, want := range map[int]uint64{0: 1, 1: 2, 2: 1, 3: 1, 4: 1, 9: 1} {
+		if got := call.KeypadCounts[digit]; got != want {
+			t.Errorf("9%d count = %d, want %d", digit, got, want)
+		}
+	}
+}
+
+func TestKeypadPrefixExpires(t *testing.T) {
+	session := &Session{}
+	now := time.Now()
+	session.handleKeypad([]byte{'9'}, now)
+	session.handleKeypad([]byte{'1'}, now.Add(2*time.Second))
+	if session.micMuted.Load() {
+		t.Fatal("stale keypad prefix triggered mute")
+	}
+	session.handleKeypad([]byte{'9'}, now.Add(3*time.Second))
+	session.handleKeypad([]byte{'1'}, now.Add(3500*time.Millisecond))
+	if !session.micMuted.Load() {
+		t.Fatal("a timely keypad sequence did not trigger mute")
+	}
+}

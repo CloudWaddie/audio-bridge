@@ -55,19 +55,25 @@ type Session struct {
 	reader  *bufio.Reader
 	scratch []byte
 
-	inFrames    atomic.Uint64
-	inBytes     atomic.Uint64
-	outFrames   atomic.Uint64
-	outBytes    atomic.Uint64
-	promptFrames atomic.Uint64
-	dtmfCount   atomic.Uint64
-	unsupported atomic.Uint64
-	malformed   atomic.Uint64
-	dropped     atomic.Uint64
-	writeErrors atomic.Uint64
-	rmsDB       atomic.Uint64
-	peakDB      atomic.Uint64
-	lastErr     atomic.Pointer[string]
+	inFrames      atomic.Uint64
+	inBytes       atomic.Uint64
+	outFrames     atomic.Uint64
+	outBytes      atomic.Uint64
+	promptFrames  atomic.Uint64
+	dtmfCount     atomic.Uint64
+	unsupported   atomic.Uint64
+	malformed     atomic.Uint64
+	dropped       atomic.Uint64
+	writeErrors   atomic.Uint64
+	rmsDB         atomic.Uint64
+	peakDB        atomic.Uint64
+	lastErr       atomic.Pointer[string]
+	keypadCounts  [10]atomic.Uint64
+	micMuted      atomic.Bool
+	micCheckPeak  atomic.Uint64
+	echoUntil     atomic.Int64
+	keypadPrefix  time.Time // owned by readLoop
+	micCheckUntil time.Time // owned by readLoop
 }
 
 // NewSession wraps an accepted connection.
@@ -86,6 +92,7 @@ func NewSession(conn net.Conn, cfg SessionConfig, log *slog.Logger) *Session {
 	s.audioKind = kind
 	s.rmsDB.Store(math.Float64bits(math.Inf(-1)))
 	s.peakDB.Store(math.Float64bits(math.Inf(-1)))
+	s.micCheckPeak.Store(math.Float64bits(math.Inf(-1)))
 	return s
 }
 
@@ -169,7 +176,7 @@ func (s *Session) playPrompt(pcm []byte) {
 
 // frameBytes returns the outbound frame size in bytes.
 func (s *Session) frameBytes() int {
-	bytes := int(int64(s.cfg.CallRate) * s.cfg.FrameDuration.Milliseconds() / 1000) * 2
+	bytes := int(int64(s.cfg.CallRate)*s.cfg.FrameDuration.Milliseconds()/1000) * 2
 	if bytes < 2 {
 		// Degenerate config guard: 20 ms at 8 kHz.
 		return 320
@@ -200,7 +207,11 @@ func (s *Session) Run(ctx context.Context) error {
 		s.PlayPrompt(prompts.Connected)
 	}
 
-	if err := s.ep.Start(runCtx, s.enqueueOutbound); err != nil {
+	if err := s.ep.Start(runCtx, func(pcm []byte) {
+		if time.Now().UnixNano() >= s.echoUntil.Load() {
+			s.enqueueOutbound(pcm)
+		}
+	}); err != nil {
 		if s.cfg.Prompts {
 			s.PlayPrompt(prompts.Error)
 		}
@@ -301,7 +312,7 @@ func (s *Session) readLoop(ctx context.Context) error {
 			return nil
 		case KindDTMF:
 			s.dtmfCount.Add(1)
-			s.log.Debug("dtmf digit", "digit", string(payload))
+			s.handleKeypad(payload, time.Now())
 		case KindError:
 			s.log.Warn("peer reported error", "code", strings.TrimSpace(string(payload)))
 		case KindUUID:
@@ -317,6 +328,37 @@ func (s *Session) readLoop(ctx context.Context) error {
 	}
 }
 
+// handleKeypad recognizes one two-digit command at a time. The prefix
+// expires after a second and is never interpreted as a standalone action.
+func (s *Session) handleKeypad(payload []byte, now time.Time) {
+	if len(payload) != 1 {
+		s.keypadPrefix = time.Time{}
+		return
+	}
+	digit := payload[0]
+	if s.keypadPrefix.IsZero() || now.Sub(s.keypadPrefix) > time.Second {
+		s.keypadPrefix = time.Time{}
+		if digit == '9' {
+			s.keypadPrefix = now
+		}
+		return
+	}
+	s.keypadPrefix = time.Time{}
+	switch digit {
+	case '0', '2', '9':
+	case '1':
+		s.micMuted.Store(!s.micMuted.Load())
+	case '3':
+		s.micCheckUntil = now.Add(12 * time.Second)
+		s.micCheckPeak.Store(math.Float64bits(math.Inf(-1)))
+	case '4':
+		s.echoUntil.Store(now.Add(5 * time.Second).UnixNano())
+	default:
+		return
+	}
+	s.keypadCounts[digit-'0'].Add(1)
+}
+
 func (s *Session) handleAudio(payload []byte) {
 	if len(payload) == 0 {
 		return
@@ -330,10 +372,24 @@ func (s *Session) handleAudio(payload []byte) {
 	}
 	s.inFrames.Add(1)
 	s.inBytes.Add(uint64(len(payload)))
-	if s.cfg.CollectAudioStats {
+	micCheck := time.Now().Before(s.micCheckUntil)
+	if s.cfg.CollectAudioStats || micCheck {
 		rms, peak := audio.Level(payload)
-		s.rmsDB.Store(math.Float64bits(rms))
-		s.storePeak(peak)
+		if s.cfg.CollectAudioStats {
+			s.rmsDB.Store(math.Float64bits(rms))
+			s.storePeak(peak)
+		}
+		if micCheck && peak > math.Float64frombits(s.micCheckPeak.Load()) {
+			s.micCheckPeak.Store(math.Float64bits(peak))
+		}
+	}
+	if time.Now().UnixNano() < s.echoUntil.Load() {
+		s.enqueueOutbound(payload)
+		return
+	}
+	if s.micMuted.Load() {
+		// Keep the input clock running while withholding the caller's audio.
+		clear(payload)
 	}
 	if err := s.ep.Write(payload); err != nil {
 		s.setError(err)
@@ -423,6 +479,12 @@ type CallSnapshot struct {
 	DroppedFrames   uint64        `json:"dropped_frames"`
 	WriteErrors     uint64        `json:"write_errors"`
 	DTMF            uint64        `json:"dtmf_digits"`
+	KeypadCounts    [10]uint64    `json:"keypad_counts"`
+	EchoActive      bool          `json:"echo_active"`
+	MicMuted        bool          `json:"mic_muted"`
+	MicCheckPeak    *float64      `json:"mic_check_peak_dbfs,omitempty"`
+	CallRate        int           `json:"call_rate"`
+	AudioStats      bool          `json:"audio_stats_enabled"`
 	Unsupported     uint64        `json:"unsupported_frames"`
 	Malformed       uint64        `json:"malformed_frames"`
 	PromptFrames    uint64        `json:"prompt_frames"`
@@ -446,9 +508,19 @@ func (s *Session) Snapshot() CallSnapshot {
 		DroppedFrames:   s.dropped.Load(),
 		WriteErrors:     s.writeErrors.Load(),
 		DTMF:            s.dtmfCount.Load(),
+		EchoActive:      time.Now().UnixNano() < s.echoUntil.Load(),
+		MicMuted:        s.micMuted.Load(),
+		CallRate:        s.cfg.CallRate,
+		AudioStats:      s.cfg.CollectAudioStats,
 		Unsupported:     s.unsupported.Load(),
 		Malformed:       s.malformed.Load(),
 		PromptFrames:    s.promptFrames.Load(),
+	}
+	for index := range snap.KeypadCounts {
+		snap.KeypadCounts[index] = s.keypadCounts[index].Load()
+	}
+	if peak := math.Float64frombits(s.micCheckPeak.Load()); !math.IsInf(peak, 0) {
+		snap.MicCheckPeak = &peak
 	}
 	if s.ep != nil {
 		snap.Endpoint = s.ep.Name()

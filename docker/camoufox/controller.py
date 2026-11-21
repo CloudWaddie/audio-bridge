@@ -206,15 +206,21 @@ def _fetch_bridge_stats() -> dict | None:
         return None
 
 
+def started_call(stats: dict) -> dict | None:
+    call = stats.get("active_call")
+    if call is None or call.get("started_at") == "0001-01-01T00:00:00Z":
+        return None
+    return call
+
+
+def call_identity(call: dict) -> tuple:
+    return call.get("uuid"), call.get("started_at")
+
+
 async def call_active() -> bool | None:
     """True once the phone call's audio endpoint has started."""
     stats = await asyncio.to_thread(_fetch_bridge_stats)
-    if stats is None:
-        return None
-    call = stats.get("active_call")
-    # Go registers the call before playing the opening prompt. While the
-    # endpoint is still starting, started_at is the zero timestamp.
-    return call is not None and call.get("started_at") != "0001-01-01T00:00:00Z"
+    return None if stats is None else started_call(stats) is not None
 
 
 # --------------------------------------------------------------------------
@@ -431,6 +437,7 @@ class VoiceController:
         self.limit_until = 0.0
         self.blocked = False
         self.ready_announced = False
+        self.call_key = None
 
     async def start(self) -> bool:
         page = self.page
@@ -514,7 +521,10 @@ class VoiceController:
         await self._announce(clip)
 
     async def _announce(self, clip: str) -> None:
-        if await call_active() is not True:
+        if self.call_key is None:
+            if await call_active() is not True:
+                return
+        elif await self.current_call() is None:
             return
         path = Path(__file__).with_name("announcements") / f"{clip}.wav"
         try:
@@ -533,6 +543,36 @@ class VoiceController:
             if player.returncode is None:
                 player.kill()
                 await player.wait()
+
+    async def current_call(self) -> dict | None:
+        stats = await asyncio.to_thread(_fetch_bridge_stats)
+        call = started_call(stats) if stats is not None else None
+        if call is None or call_identity(call) != self.call_key:
+            return None
+        return call
+
+    async def keypad_feedback(self, digit: int, call: dict) -> None:
+        if digit == 0:
+            await self._announce("keypad_help")
+        elif digit == 1:
+            await self._announce("muted" if call.get("mic_muted") else "unmuted")
+        elif digit == 3:
+            await self._announce("mic_speak")
+            await asyncio.sleep(2)
+            measured = await self.current_call()
+            if measured is not None and measured["keypad_counts"][3] == call["keypad_counts"][3]:
+                peak = measured.get("mic_check_peak_dbfs", float("-inf"))
+                clip = "mic_clip" if peak >= -0.5 else "mic_quiet" if peak < -40 else "mic_good"
+                await self._announce(clip)
+        elif digit == 9:
+            await self._announce("voice_up" if self.active else "voice_down")
+            rate = call.get("call_rate")
+            if rate in (8000, 12000, 16000, 24000, 32000, 44100, 48000, 96000, 192000):
+                await self._announce(f"rate_{rate}")
+            if call.get("audio_stats_enabled", True):
+                heard = call.get("peak_dbfs", float("-inf")) >= -40
+                await self._announce("signal" if heard else "no_signal")
+            await self._announce("dropped" if call.get("dropped_frames") else "no_drops")
 
     async def handle_rate_limit(self) -> None:
         await self._dismiss_rate_limit(self.page)
@@ -600,6 +640,8 @@ async def session_loop(context, stop: asyncio.Event) -> None:
     # True while the page sits on the voice URL. Navigated to only when
     # a call is active; every other goto returns to the idle page.
     on_voice_page = False
+    keypad_counts = [0] * 10
+    voice_url = CFG.voice_url
 
     await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
     log.info("opened %s (idle)", CFG.idle_url)
@@ -623,7 +665,9 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                 failures = 0
                 continue
 
-            active = await call_active()
+            stats = await asyncio.to_thread(_fetch_bridge_stats)
+            call = started_call(stats) if stats is not None else None
+            active = None if stats is None else call is not None
             STATUS.update(
                 call_active=bool(active),
                 bridge_up=active is not None,
@@ -640,6 +684,39 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                 await asyncio.sleep(CFG.poll_interval)
                 continue
 
+            if call is not None and call_identity(call) != voice.call_key:
+                if on_voice_page or voice.active:
+                    if not await voice.end():
+                        continue
+                voice.call_key = call_identity(call)
+                voice.blocked = False
+                voice.ready_announced = False
+                keypad_counts = [0] * 10
+                voice_url = CFG.voice_url
+                on_voice_page = False
+
+            if call is not None and not call.get("echo_active"):
+                counts = call.get("keypad_counts", keypad_counts)
+                handled = False
+                if counts[2] > keypad_counts[2]:
+                    if not await voice.end():
+                        await asyncio.sleep(CFG.poll_interval)
+                        continue
+                    keypad_counts[2] = counts[2]
+                    voice.blocked = False
+                    voice.ready_announced = False
+                    on_voice_page = False
+                    voice_url = urlunsplit(urlsplit(CFG.voice_url)._replace(path="/", fragment=""))
+                    await voice._announce("fresh_chat")
+                    handled = True
+                for digit in (0, 1, 3, 9):
+                    if counts[digit] > keypad_counts[digit]:
+                        keypad_counts[digit] = counts[digit]
+                        await voice.keypad_feedback(digit, call)
+                        handled = True
+                if handled and await voice.current_call() is None:
+                    continue
+
             if not active and not voice.active and await voice_overlay_present(page):
                 # A leaked overlay: leaving the page tears it down and
                 # stops the allowance burn; retried next poll if the
@@ -651,6 +728,7 @@ async def session_loop(context, stop: asyncio.Event) -> None:
             if not active:
                 voice.blocked = False
                 voice.ready_announced = False
+                voice.call_key = None
                 if on_voice_page and not voice.active:
                     on_voice_page = not await voice.end()
 
@@ -670,7 +748,7 @@ async def session_loop(context, stop: asyncio.Event) -> None:
                         # retry voice.start() on the same page instead.
                         try:
                             response = await page.goto(
-                                CFG.voice_url, wait_until="domcontentloaded", timeout=60_000
+                                voice_url, wait_until="domcontentloaded", timeout=60_000
                             )
                             if response is not None and response.status >= 400:
                                 blocker = await voice_start_blocker(page)
