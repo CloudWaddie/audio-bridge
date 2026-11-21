@@ -22,9 +22,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Same UID as the bridge and audio containers (10001): all three share the
-# /pulse socket volume.
-RUN addgroup -g 10001 audiosocket \
-    && adduser --system --uid 10001 --gid 10001 --home /home/camoufox camoufox \
+# /pulse socket volume. useradd/groupadd, not adduser: Debian's adduser
+# rejects --gid in --system mode.
+RUN groupadd -g 10001 audiosocket \
+    && useradd --system --uid 10001 --gid 10001 --create-home \
+        --home-dir /home/camoufox --shell /bin/bash camoufox \
     && mkdir -p /data \
     && chown -R camoufox:audiosocket /data /home/camoufox
 
