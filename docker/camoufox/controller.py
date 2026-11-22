@@ -632,8 +632,33 @@ class VoiceController:
 
 
 async def session_loop(context, stop: asyncio.Event) -> None:
-    """Drive one browser context until it breaks or stop is requested."""
+    """Restart the browser if its controlled page closes or crashes."""
     page = context.pages[0] if context.pages else await context.new_page()
+    lost = asyncio.get_running_loop().create_future()
+
+    def page_lost(reason: str) -> None:
+        if not lost.done():
+            lost.set_result(reason)
+
+    page.on("close", lambda _: page_lost("Voice browser page closed"))
+    page.on("crash", lambda _: page_lost("Voice browser page crashed"))
+    context.on("close", lambda _: page_lost("Voice browser context closed"))
+    if page.is_closed():
+        page_lost("Voice browser page closed")
+
+    driver = asyncio.create_task(drive_page(page, stop))
+    try:
+        await asyncio.wait((lost, driver), return_when=asyncio.FIRST_COMPLETED)
+        if lost.done() and not stop.is_set():
+            raise RuntimeError(lost.result())
+        await driver
+    finally:
+        lost.cancel()
+        driver.cancel()
+        await asyncio.gather(driver, return_exceptions=True)
+
+
+async def drive_page(page, stop: asyncio.Event) -> None:
     voice = VoiceController(page)
     failures = 0
     last_login_state = None
@@ -830,6 +855,7 @@ async def session_loop(context, stop: asyncio.Event) -> None:
 async def run(stop: asyncio.Event) -> None:
     backoff = CFG.restart_backoff_initial
     while not stop.is_set():
+        launched_at = None
         try:
             launch = {
                 "persistent_context": True,
@@ -854,7 +880,7 @@ async def run(stop: asyncio.Event) -> None:
                 # The same display is served over VNC for the one-time login.
                 launch["virtual_display"] = CFG.display
             async with AsyncCamoufox(**launch) as context:
-                backoff = CFG.restart_backoff_initial
+                launched_at = time.monotonic()
                 await session_loop(context, stop)
                 # Clean exit (stop requested): end any voice session.
                 try:
@@ -870,7 +896,13 @@ async def run(stop: asyncio.Event) -> None:
         except Exception as exc:
             if stop.is_set():
                 break
+            if launched_at is not None and time.monotonic() - launched_at >= CFG.restart_backoff_max:
+                backoff = CFG.restart_backoff_initial
             STATUS.update(
+                ready=False,
+                voice_active=False,
+                logged_in=False,
+                login_state="unknown",
                 last_error=str(exc),
                 browser_restarts=STATUS.snapshot()["browser_restarts"] + 1,
             )
