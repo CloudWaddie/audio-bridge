@@ -31,7 +31,7 @@ import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from camoufox.async_api import AsyncCamoufox
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -205,6 +205,19 @@ def _fetch_bridge_stats() -> dict | None:
             return json.loads(response.read().decode())
     except (urllib.error.URLError, OSError, ValueError):
         return None
+
+
+def _hangup_bridge_call(uuid: str) -> bool:
+    """Request a hangup for this exact call, never for a later caller."""
+    base = CFG.bridge_stats_url.rsplit("/", 1)[0]
+    url = f"{base}/calls/{quote(uuid, safe='')}/hangup"
+    try:
+        request = urllib.request.Request(url, data=b"", method="POST")
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.status == 204
+    except (urllib.error.URLError, OSError) as exc:
+        log.warning("bridge hangup request failed for %s: %s", uuid, exc)
+        return False
 
 
 def started_call(stats: dict) -> dict | None:
@@ -777,10 +790,20 @@ async def drive_page(page, stop: asyncio.Event, call_key: tuple | None = None) -
                 elif blocker := await voice_start_blocker(page):
                     await voice.block(*blocker)
                 elif not await voice_overlay_present(page):
-                    log.info("voice overlay vanished mid-call; restarting voice")
+                    # voice.active is only set after the overlay was observed.
+                    # Once an established Voice session ends, end the phone
+                    # call as well rather than starting a new Voice session.
+                    log.info("voice overlay disappeared after starting; hanging up call")
                     voice.active = False
-                    if await voice.start():
-                        STATUS.update(voice_active=True)
+                    STATUS.update(voice_active=False)
+                    for attempt in range(3):
+                        if await asyncio.to_thread(_hangup_bridge_call, call["uuid"]):
+                            break
+                        if attempt < 2:
+                            await asyncio.sleep(0.25)
+                    else:
+                        log.error("could not signal hangup for call %s", call["uuid"])
+                    return  # session_loop closes the browser context
                 failures = 0
 
             STATUS.update(
