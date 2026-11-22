@@ -167,6 +167,20 @@ func (s *Server) handle(conn net.Conn) {
 	s.completed.Add(1)
 }
 
+// HangupCall terminates only the call with this UUID.
+// Returning false means the call has already ended or its UUID does not match.
+func (s *Server) HangupCall(uuid string) bool {
+	s.mu.Lock()
+	active := s.active
+	if active == nil || active.UUID() != uuid {
+		s.mu.Unlock()
+		return false
+	}
+	s.mu.Unlock()
+	active.Hangup()
+	return true
+}
+
 // Shutdown stops accepting calls, cancels active sessions and waits for them
 // to finish or for ctx to expire.
 func (s *Server) Shutdown(ctx context.Context) error {
