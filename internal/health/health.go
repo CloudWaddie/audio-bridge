@@ -20,17 +20,19 @@ type Server struct {
 	log  *slog.Logger
 	srv  *http.Server
 	snap func() audiosocket.Snapshot
+	hangup func(string) bool
 }
 
 // New builds the server. The snapshot function is called per request.
-func New(addr string, log *slog.Logger, snap func() audiosocket.Snapshot) *Server {
-	s := &Server{log: log, snap: snap}
+func New(addr string, log *slog.Logger, snap func() audiosocket.Snapshot, hangup func(string) bool) *Server {
+	s := &Server{log: log, snap: snap, hangup: hangup}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleLiveness)
 	mux.HandleFunc("GET /readyz", s.handleReadiness)
 	mux.HandleFunc("GET /stats", s.handleStats)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
+	mux.HandleFunc("POST /calls/{uuid}/hangup", s.handleHangup)
 
 	s.srv = &http.Server{
 		Addr:              addr,
@@ -59,6 +61,14 @@ func (s *Server) Start() error {
 
 // Shutdown stops the HTTP server.
 func (s *Server) Shutdown(ctx context.Context) error { return s.srv.Shutdown(ctx) }
+
+func (s *Server) handleHangup(w http.ResponseWriter, r *http.Request) {
+	if s.hangup == nil || !s.hangup(r.PathValue("uuid")) {
+		http.Error(w, "call not found", http.StatusNotFound)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
 
 func (s *Server) handleLiveness(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
