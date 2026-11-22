@@ -72,7 +72,7 @@ func run() error {
 
 	var healthSrv *health.Server
 	if cfg.HealthAddr != "" {
-		healthSrv = health.New(cfg.HealthAddr, logger, server.Snapshot)
+		healthSrv = health.New(cfg.HealthAddr, logger, server.Snapshot, server.HangupCall)
 		if err := healthSrv.Start(); err != nil {
 			return fmt.Errorf("start health server: %w", err)
 		}
