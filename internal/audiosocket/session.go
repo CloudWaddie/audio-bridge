@@ -41,6 +41,8 @@ type SessionConfig struct {
 // the server after the UUID frame has been validated.
 type Session struct {
 	conn net.Conn
+	writeMu sync.Mutex // serialize audio and hangup writes
+	hangupRequested atomic.Bool
 	cfg  SessionConfig
 	log  *slog.Logger
 	ep   bridge.Endpoint
@@ -134,6 +136,22 @@ func (s *Session) Reject(reason string) {
 	buf := AppendFrame(nil, KindError, []byte(reason))
 	buf = AppendHangup(buf)
 	_, _ = s.conn.Write(buf)
+}
+
+// Hangup requests a remote hangup for this call and unblocks the reader.
+// It is safe to call repeatedly and concurrently with the audio writer.
+func (s *Session) Hangup() {
+	if !s.hangupRequested.CompareAndSwap(false, true) {
+		return
+	}
+	s.writeMu.Lock()
+	_ = s.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, err := s.conn.Write(AppendHangup(nil))
+	s.writeMu.Unlock()
+	if err != nil {
+		s.log.Warn("could not send AudioSocket hangup frame", "err", err)
+	}
+	_ = s.conn.Close()
 }
 
 // PlayPrompt plays a baked prompt to the caller, best effort. It is meant
@@ -429,10 +447,21 @@ func (s *Session) writeLoop(ctx context.Context) {
 			return
 		}
 		buf = AppendFrame(buf[:0], s.audioKind, payload)
-		if err := s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout)); err != nil {
+		s.writeMu.Lock()
+		if s.hangupRequested.Load() {
+			s.writeMu.Unlock()
 			return
 		}
-		if _, err := s.conn.Write(buf); err != nil {
+		deadlineErr := s.conn.SetWriteDeadline(time.Now().Add(s.cfg.WriteTimeout))
+		var writeErr error
+		if deadlineErr == nil {
+			_, writeErr = s.conn.Write(buf)
+		}
+		s.writeMu.Unlock()
+		if deadlineErr != nil {
+			return
+		}
+		if err := writeErr; err != nil {
 			s.writeErrors.Add(1)
 			if ctx.Err() == nil {
 				s.setError(err)
