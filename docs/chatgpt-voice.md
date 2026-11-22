@@ -38,9 +38,10 @@ set `BRIDGE_MODE=echo` and the stack behaves exactly as before.
 
 ## How the web page behaves (measured, Nov 2026)
 
-The browser idles on `https://chatgpt.com/` and opens
-`https://chatgpt.com/?mode=voice` only while a call is active, so no
-session runs between calls. Verified against the live site:
+The controller polls for incoming calls with the browser closed. It opens
+`https://chatgpt.com/?mode=voice` when the call audio starts and closes the
+browser at hangup. The saved browser profile retains login across calls.
+`CF_LOGIN_ONLY=true` keeps the browser open for setup.
 
 - **No login required to test**: the anonymous page offers a single
   **Tap to talk** button. One tap starts a GPT-Live session; no tap is needed
@@ -175,9 +176,8 @@ Recovery behavior:
   the bridge's prompts. Regenerate those clips with `cmd/prompt-tts`
   (see the command's `-h`).
 - The controller restarts the browser after repeated page failures
-  (`CF_PAGE_FAILURES_BEFORE_RESTART`, default 5), closes stray voice
-  overlays between calls so the allowance is never burned silently, and
-  reloads to a fresh page after every call.
+  (`CF_PAGE_FAILURES_BEFORE_RESTART`, default 5). Each call launches its
+  own browser session, so Voice and Firefox are closed between calls.
 - The call can run until hangup (`BRIDGE_READ_TIMEOUT=0`,
   `BRIDGE_MAX_CALL_DURATION=0` by default); set either to bound it.
 - All three containers have Docker healthchecks; Coolify restarts a service
@@ -204,7 +204,7 @@ docker compose up -d camoufox
   today's testing can exhaust — ChatGPT then shows a
   `modal-voice-rate-limit` dialog, which the controller recognizes, closes
   and backs off from for 10 minutes; Plus: ~3 h per rolling 24 h under
-  your login). Sessions end with the call and the page reloads, so idle
+  your login). The browser closes at hangup, so idle
   time is not billed. When `/statusz` shows `"voice_limited": true`, either
   wait for the free-tier reset or complete the one-time login.
 - **One voice conversation at a time** — matches the bridge's one-call slot;

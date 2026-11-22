@@ -133,6 +133,7 @@ class Status:
         self._data = {
             "running": True,
             "ready": False,  # browser up, logged in, able to take a call
+            "browser_open": False,
             "logged_in": False,
             "login_state": "unknown",
             "voice_active": False,
@@ -429,12 +430,14 @@ async def save_debug(page, tag: str) -> None:
 class VoiceController:
     """Starts and ends ChatGPT Voice sessions on one open page."""
 
+    # The cooldown belongs to the controller process, across calls and browsers.
+    limit_until = 0.0
+
     def __init__(self, page) -> None:
         self.page = page
         self.active = False
         self.failures = 0
         self.limit_hit = False
-        self.limit_until = 0.0
         self.blocked = False
         self.ready_announced = False
         self.call_key = None
@@ -577,7 +580,7 @@ class VoiceController:
     async def handle_rate_limit(self) -> None:
         await self._dismiss_rate_limit(self.page)
         self.limit_hit = True
-        self.limit_until = time.monotonic() + RATE_LIMIT_BACKOFF_S
+        VoiceController.limit_until = time.monotonic() + RATE_LIMIT_BACKOFF_S
         STATUS.update(voice_limited=True)
         await self.block("limit", "ChatGPT Voice usage limit reached")
 
@@ -619,19 +622,21 @@ class VoiceController:
         log.warning("voice session did not end within %ss", CFG.voice_end_timeout)
         return False
 
-    async def recover(self) -> None:
-        """End a stale voice session (call already gone)."""
-        if await voice_overlay_present(self.page):
-            log.info("ending stale voice session")
-            await self.end()
-
-
 # --------------------------------------------------------------------------
 # Main loop
 # --------------------------------------------------------------------------
 
 
-async def session_loop(context, stop: asyncio.Event) -> None:
+async def wait_for_call_end(call_key: tuple) -> None:
+    while True:
+        stats = await asyncio.to_thread(_fetch_bridge_stats)
+        call = started_call(stats) if stats is not None else None
+        if call is None or call_identity(call) != call_key:
+            return
+        await asyncio.sleep(CFG.poll_interval)
+
+
+async def session_loop(context, stop: asyncio.Event, call_key: tuple | None = None) -> None:
     """Restart the browser if its controlled page closes or crashes."""
     page = context.pages[0] if context.pages else await context.new_page()
     lost = asyncio.get_running_loop().create_future()
@@ -646,30 +651,35 @@ async def session_loop(context, stop: asyncio.Event) -> None:
     if page.is_closed():
         page_lost("Voice browser page closed")
 
-    driver = asyncio.create_task(drive_page(page, stop))
+    driver = asyncio.create_task(drive_page(page, stop, call_key))
+    tasks = [driver]
+    if call_key is not None:
+        tasks.append(asyncio.create_task(wait_for_call_end(call_key)))
     try:
-        await asyncio.wait((lost, driver), return_when=asyncio.FIRST_COMPLETED)
-        if lost.done() and not stop.is_set():
+        done, _ = await asyncio.wait([lost, *tasks], return_when=asyncio.FIRST_COMPLETED)
+        if lost in done and not stop.is_set():
             raise RuntimeError(lost.result())
-        await driver
+        for task in done - {lost}:
+            await task
     finally:
         lost.cancel()
-        driver.cancel()
-        await asyncio.gather(driver, return_exceptions=True)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def drive_page(page, stop: asyncio.Event) -> None:
+async def drive_page(page, stop: asyncio.Event, call_key: tuple | None = None) -> None:
     voice = VoiceController(page)
+    voice.call_key = call_key
     failures = 0
     last_login_state = None
-    # True while the page sits on the voice URL. Navigated to only when
-    # a call is active; every other goto returns to the idle page.
     on_voice_page = False
     keypad_counts = [0] * 10
     voice_url = CFG.voice_url
 
-    await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
-    log.info("opened %s (idle)", CFG.idle_url)
+    if CFG.login_only:
+        await page.goto(CFG.idle_url, wait_until="domcontentloaded", timeout=60_000)
+        log.info("opened %s for login", CFG.idle_url)
 
     while not stop.is_set():
         try:
@@ -692,35 +702,15 @@ async def drive_page(page, stop: asyncio.Event) -> None:
 
             stats = await asyncio.to_thread(_fetch_bridge_stats)
             call = started_call(stats) if stats is not None else None
-            active = None if stats is None else call is not None
-            STATUS.update(
-                call_active=bool(active),
-                bridge_up=active is not None,
-            )
+            STATUS.update(call_active=call is not None, bridge_up=stats is not None)
+            if call is None or (voice.call_key is not None and call_identity(call) != voice.call_key):
+                # Exiting the persistent context releases Firefox and ends Voice.
+                return
 
-            if active is None:
-                # Bridge unreachable: make sure we are not burning the
-                # ChatGPT voice session while nobody is on the line.
-                # voice.recover() ends the session by leaving the voice
-                # page; a failed navigation is retried next poll.
-                if voice.active or await voice_overlay_present(page):
-                    await voice.recover()
-                    on_voice_page = False
-                await asyncio.sleep(CFG.poll_interval)
-                continue
-
-            if call is not None and call_identity(call) != voice.call_key:
-                if on_voice_page or voice.active:
-                    if not await voice.end():
-                        continue
+            if voice.call_key is None:
                 voice.call_key = call_identity(call)
-                voice.blocked = False
-                voice.ready_announced = False
-                keypad_counts = [0] * 10
-                voice_url = CFG.voice_url
-                on_voice_page = False
 
-            if call is not None and not call.get("echo_active"):
+            if not call.get("echo_active"):
                 counts = call.get("keypad_counts", keypad_counts)
                 handled = False
                 if counts[2] > keypad_counts[2]:
@@ -742,76 +732,45 @@ async def drive_page(page, stop: asyncio.Event) -> None:
                 if handled and await voice.current_call() is None:
                     continue
 
-            if not active and not voice.active and await voice_overlay_present(page):
-                # A leaked overlay: leaving the page tears it down and
-                # stops the allowance burn; retried next poll if the
-                # navigation fails.
-                log.info("closing stray voice overlay between calls")
-                await voice.recover()
-                on_voice_page = False
-
-            if not active:
-                voice.blocked = False
-                voice.ready_announced = False
-                voice.call_key = None
-                if on_voice_page and not voice.active:
-                    on_voice_page = not await voice.end()
-
-            if active and voice.blocked:
+            if voice.blocked:
                 if await voice_overlay_present(page):
                     on_voice_page = not await voice.end()
-            elif active and not voice.active:
-                if CFG.require_login and login_state != "in":
-                    await voice.block("login", "ChatGPT Voice requires login")
-                else:
-                    if not on_voice_page:
-                        # One navigation per call. While a call is active
-                        # the page sits on the voice URL: logged in,
-                        # ?mode=voice auto-starts the session; anonymous
-                        # shows the "Tap to talk" button. Navigating
-                        # again each poll would interrupt hydration, so
-                        # retry voice.start() on the same page instead.
-                        try:
-                            response = await page.goto(
-                                voice_url, wait_until="domcontentloaded", timeout=60_000
-                            )
-                            if response is not None and response.status >= 400:
-                                blocker = await voice_start_blocker(page)
-                                await voice.block(*(blocker or (
-                                    "page_error", f"ChatGPT Voice page returned HTTP {response.status}"
-                                )))
-                            on_voice_page = True
-                            log.info("opened %s for the call", CFG.voice_url)
-                        except Exception as exc:
-                            log.warning("could not open the voice page: %s", exc)
-                            await voice.block("page_error", "Could not open the ChatGPT Voice page")
-                    if on_voice_page and await voice.start():
+            elif not voice.active:
+                if not on_voice_page:
+                    try:
+                        response = await page.goto(
+                            voice_url, wait_until="domcontentloaded", timeout=60_000
+                        )
+                        if response is not None and response.status >= 400:
+                            blocker = await voice_start_blocker(page)
+                            await voice.block(*(blocker or (
+                                "page_error", f"ChatGPT Voice page returned HTTP {response.status}"
+                            )))
+                        on_voice_page = True
+                        log.info("opened %s for the call", voice_url)
+                    except Exception as exc:
+                        log.warning("could not open the voice page: %s", exc)
+                        await voice.block("page_error", "Could not open the ChatGPT Voice page")
+                    if await voice.current_call() is None:
+                        return
+                if on_voice_page and not voice.blocked:
+                    login_state = await detect_login(page)
+                    STATUS.update(
+                        logged_in=login_state == "in", login_state=login_state, page_url=page.url
+                    )
+                    if CFG.require_login and login_state != "in":
+                        await voice.block("login", "ChatGPT Voice requires login")
+                    elif await voice.start():
                         sessions = STATUS.snapshot()["voice_sessions_started"] + 1
                         STATUS.update(
                             voice_active=True,
                             ready=True,
                             voice_sessions_started=sessions,
                         )
-                    elif on_voice_page and not voice.blocked and not voice.limit_hit:
+                    elif not voice.blocked and not voice.limit_hit:
                         failures += 1
 
-            elif not active and voice.active:
-                # voice.end() leaves the voice page itself: navigation
-                # tears the session down (no end control to find), and
-                # the next call opens a fresh conversation.
-                ended = await voice.end()
-                if ended:
-                    sessions = STATUS.snapshot()["voice_sessions_ended"] + 1
-                    STATUS.update(voice_sessions_ended=sessions)
-                    on_voice_page = False
-                    log.info("returned to the idle page after the call")
-                else:
-                    failures += 1
-                    # The page state is unknown after a failed goto;
-                    # the next call navigates to the voice page anyway.
-                    on_voice_page = False
-
-            elif active and voice.active:
+            else:
                 # The limit can arrive while the overlay is still visible.
                 if await voice_rate_limited(page):
                     await voice.handle_rate_limit()
@@ -825,7 +784,7 @@ async def drive_page(page, stop: asyncio.Event) -> None:
                 failures = 0
 
             STATUS.update(
-                ready=login_state == "in" and (voice.active or not active),
+                ready=voice.active,
                 consecutive_failures=failures,
             )
 
@@ -856,7 +815,18 @@ async def run(stop: asyncio.Event) -> None:
     backoff = CFG.restart_backoff_initial
     while not stop.is_set():
         launched_at = None
+        call_key = None
         try:
+            if not CFG.login_only:
+                stats = await asyncio.to_thread(_fetch_bridge_stats)
+                call = started_call(stats) if stats is not None else None
+                STATUS.update(bridge_up=stats is not None, call_active=call is not None)
+                if call is None:
+                    await asyncio.sleep(CFG.poll_interval)
+                    continue
+                if stop.is_set():
+                    break
+                call_key = call_identity(call)
             launch = {
                 "persistent_context": True,
                 "user_data_dir": CFG.profile_dir,
@@ -881,16 +851,13 @@ async def run(stop: asyncio.Event) -> None:
                 launch["virtual_display"] = CFG.display
             async with AsyncCamoufox(**launch) as context:
                 launched_at = time.monotonic()
-                await session_loop(context, stop)
-                # Clean exit (stop requested): end any voice session.
-                try:
-                    page = context.pages[0] if context.pages else None
-                    if page is not None:
-                        voice = VoiceController(page)
-                        if voice.active or await voice_overlay_present(page):
-                            await voice.end()
-                except Exception:
-                    pass
+                STATUS.update(browser_open=True)
+                await session_loop(context, stop, call_key)
+            state = STATUS.snapshot()
+            if state["voice_active"]:
+                STATUS.update(voice_sessions_ended=state["voice_sessions_ended"] + 1)
+            log.info("closed browser after call")
+            backoff = CFG.restart_backoff_initial
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -899,6 +866,7 @@ async def run(stop: asyncio.Event) -> None:
             if launched_at is not None and time.monotonic() - launched_at >= CFG.restart_backoff_max:
                 backoff = CFG.restart_backoff_initial
             STATUS.update(
+                browser_open=False,
                 ready=False,
                 voice_active=False,
                 logged_in=False,
@@ -909,6 +877,9 @@ async def run(stop: asyncio.Event) -> None:
             log.error("browser session died: %s; restarting in %ss", exc, backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, CFG.restart_backoff_max)
+        finally:
+            if launched_at is not None:
+                STATUS.update(browser_open=False, ready=False, voice_active=False, page_url="")
 
 
 async def main() -> None:
